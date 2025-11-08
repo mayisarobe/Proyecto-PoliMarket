@@ -1,1 +1,7 @@
 .env
+.conda
+.venv
+__pycache__\
+polimarket
+client.cpython-312.pyc
+fairprice.cpython-312.pyc
