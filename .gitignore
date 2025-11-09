@@ -1,8 +1,31 @@
-# Archivos y carpetas que no deben subirse al repo
+# Sensibles / locales
 .env
+.env.*
+*.key
+*.pem
+
+# Python cache y binarios
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.so
+
+# Entornos
+.venv/
+venv/
+conda/
+.conda/
+
+# IDEs / OS
 .vscode/
-.DS_Store
 .idea/
+.DS_Store
+
+# Logs
 *.log
+
+# Artefactos del proyecto
+mm_results.png
+mm_timeseries.csv
+live_book_*.csv
+
