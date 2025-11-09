@@ -1,2 +1,5 @@
 py-clob-client
 python-dotenv
+requests>=2.31.0
+urllib3>=2.0.0
+matplotlib>=3.8
