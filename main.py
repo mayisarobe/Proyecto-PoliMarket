@@ -13,14 +13,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import matplotlib.pyplot as plt
 
-# --- TUS CLASES ---
-from fairprice import FairPrice          # tu Kalman 1D mejorado
-from spread import SpreadCalculator      # tu Avellaneda–Stoikov
+# --- Nuestras clases ---
+from fairprice import FairPrice            # Kalman 1D mejorado (usa clip_prob/clip01)
+from spread import SpreadCalculator        # Avellaneda–Stoikov mejorado
 
 CLOB_BASE = "https://clob.polymarket.com"
 
 # ============ Sesión HTTP robusta (evita 429/HTML/Cloudflare) ============
-def _make_session():
+def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PolymarketMM/1.0",
@@ -37,19 +37,23 @@ def _make_session():
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-_SESSION = None
+_SESSION: Optional[requests.Session] = None
 def http_get_json(url: str, timeout: int = 20):
+    """
+    GET JSON estricto: si la respuesta no es application/json lanza error
+    e incluye un snippet del body para debuggear HTML/Cloudflare.
+    """
     global _SESSION
     if _SESSION is None:
         _SESSION = _make_session()
     r = _SESSION.get(url, timeout=timeout)
-    ct = r.headers.get("Content-Type", "")
-    if "application/json" not in ct.lower():
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "application/json" not in ct:
         snippet = r.text[:300].replace("\n", " ")
         raise RuntimeError(f"No-JSON {r.status_code} {ct} body[:300]={snippet!r} url={url}")
     return r.json()
 
-# ============ Parsing helpers ============
+# ============ Helpers de parsing ============
 def _ensure_list(x):
     if isinstance(x, list):
         return x
@@ -61,30 +65,73 @@ def _ensure_list(x):
     return []
 
 def is_decimal_token_id(s: str) -> bool:
+    # Los token_id del CLOB son enteros decimales muy largos
     return bool(re.fullmatch(r"\d{25,}", s))
 
 def parse_polymarket_url(url: str) -> dict:
+    """
+    Soporta URLs tipo:
+      - https://polymarket.com/event/<slug>
+      - https://polymarket.com/market/<slug>?tid=<token_id_decimal>
+      - https://polymarket.com/markets/<slug>
+    """
     u = urlparse(url)
-    out = {}
+    out: Dict[str, str] = {}
     qs = parse_qs(u.query)
     if "tid" in qs:
         tid = qs["tid"][0]
         if is_decimal_token_id(tid):
             out["token_id"] = tid
-    path = u.path.strip("/")
+    path = (u.path or "").strip("/")
     m = re.search(r"(?:event|markets?)/([^/?#]+)", path, flags=re.I)
     if m:
         out["slug"] = m.group(1)
     return out
 
 # ============ Resolver token_id desde /markets ============
+def _extract_markets_payload(obj) -> Optional[List[dict]]:
+    """
+    Devuelve lista de mercados desde distintas variantes de payload:
+    - dict con 'markets' | 'data' | 'results'
+    - lista de dicts directamente
+    """
+    if isinstance(obj, dict):
+        for key in ("markets", "data", "results"):
+            if key in obj and isinstance(obj[key], list):
+                return obj[key]
+        # algunos backends devuelven {'markets': {'data': [...]}}
+        if "markets" in obj and isinstance(obj["markets"], dict) and "data" in obj["markets"]:
+            if isinstance(obj["markets"]["data"], list):
+                return obj["markets"]["data"]
+        return None
+    if isinstance(obj, list):
+        # asumimos lista de mercados
+        return obj
+    return None
+
 def fetch_markets() -> List[dict]:
-    data = http_get_json(f"{CLOB_BASE}/markets")
-    if isinstance(data, dict) and "markets" in data:
-        return data["markets"]
-    if isinstance(data, list):
-        return data
-    raise TypeError("Formato inesperado en /markets")
+    """
+    Intenta varias variantes de /markets. Devuelve lista de mercados o lanza error detallado.
+    """
+    candidates = [
+        f"{CLOB_BASE}/markets?limit=1000",
+        f"{CLOB_BASE}/markets",
+        f"{CLOB_BASE}/markets?active=true",
+    ]
+    last_err = None
+    for url in candidates:
+        try:
+            data = http_get_json(url)
+            markets = _extract_markets_payload(data)
+            if markets and isinstance(markets, list):
+                return markets
+        except Exception as e:
+            last_err = e
+            time.sleep(0.3)
+            continue
+    if last_err:
+        raise RuntimeError(f"No se pudo obtener /markets de {candidates}. Último error: {last_err}")
+    raise TypeError("Formato inesperado en /markets (sin 'markets'/'data'/'results' ni lista).")
 
 def find_market_by_condition(condition_id_hex: str) -> dict:
     cid = condition_id_hex.lower()
@@ -94,15 +141,15 @@ def find_market_by_condition(condition_id_hex: str) -> dict:
     raise ValueError(f"conditionId no encontrado: {condition_id_hex}")
 
 def find_market_by_slug(slug: str) -> dict:
-    slug = slug.strip("/").lower()
+    target = slug.strip("/").lower()
     for m in fetch_markets():
         mslug = (m.get("slug") or m.get("urlSlug") or "").strip("/").lower()
-        if mslug == slug:
+        if mslug == target:
             return m
-    # fallback: contiene
+    # fallback contiene
     for m in fetch_markets():
         mslug = (m.get("slug") or m.get("urlSlug") or "").strip("/").lower()
-        if slug in mslug:
+        if target in mslug:
             return m
     raise ValueError(f"Slug no encontrado: {slug}")
 
@@ -110,7 +157,8 @@ def outcome_to_token_map(market: dict) -> Tuple[str, Dict[str, str], List[str]]:
     question = market.get("question", "Unknown market")
     outcomes = _ensure_list(market.get("outcomes", []))
     clob_ids = _ensure_list(market.get("clobTokenIds", []))
-    if not outcomes and market.get("tokens"):
+    # fallback a estructura 'tokens'
+    if (not outcomes or not clob_ids) and market.get("tokens"):
         outcomes = [t.get("outcome") for t in market["tokens"]]
         clob_ids = [t.get("id") for t in market["tokens"]]
     if len(outcomes) != len(clob_ids):
@@ -125,7 +173,8 @@ def resolve_token_from_market(market: dict, outcome: Optional[str], outcome_inde
         if outcome in mapping:
             return mapping[outcome]
         for o in outcomes:
-            if oq == str(o).lower() or oq in str(o).lower():
+            so = str(o)
+            if oq == so.lower() or oq in so.lower():
                 return mapping[o]
         raise SystemExit(f"Outcome '{outcome}' no coincide. Disponibles: {outcomes}")
     if outcome_index is not None:
@@ -169,6 +218,9 @@ def _first_price(arr):
     return None
 
 def get_best_bid_ask(token_id: str, debug: bool = False):
+    """
+    Intenta varios endpoints del CLOB y devuelve (best_bid, best_ask) como floats o None.
+    """
     for ep in ["orderbook", "book", "orders"]:
         url = f"{CLOB_BASE}/{ep}?token_id={token_id}"
         try:
@@ -183,7 +235,7 @@ def get_best_bid_ask(token_id: str, debug: bool = False):
                 if bb is not None or ba is not None:
                     return bb, ba
             elif isinstance(data, list):
-                # /orders: lista de órdenes
+                # /orders devuelve lista simple de órdenes
                 bids = [o for o in data if str(o.get("side","")).lower()=="buy"]
                 asks = [o for o in data if str(o.get("side","")).lower()=="sell"]
                 bids.sort(key=lambda x: float(x.get("price") or x.get("px") or 0), reverse=True)
@@ -212,7 +264,9 @@ def safe_mid(bb, ba, last_mid: Optional[float], default_mid: float) -> float:
 
 # ============ MAIN ============
 def main():
-    ap = argparse.ArgumentParser(description="Polymarket MM: FairPrice(Kalman) + Avellaneda–Stoikov + CSV/Gráfica.")
+    ap = argparse.ArgumentParser(
+        description="Polymarket MM: FairPrice(Kalman) + Avellaneda–Stoikov + CSV/Gráfica."
+    )
 
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--token_id", type=str, help="Token ID decimal del CLOB (directo).")
@@ -223,18 +277,18 @@ def main():
     ap.add_argument("--outcome_index", type=int, help="Índice del outcome (si condition/url).")
     ap.add_argument("--list_outcomes", action="store_true", help="Solo listar outcomes/token_id y salir.")
 
-    # muestreo
-    ap.add_argument("--samples", type=int, default=120, help="Número de lecturas.")
-    ap.add_argument("--interval", type=float, default=0.5, help="Segundos entre lecturas.")
+    # muestreo (más datos, mismo rango temporal)
+    ap.add_argument("--samples", type=int, default=3600, help="Número de lecturas (p.ej., 3600=1h a 1s).")
+    ap.add_argument("--interval", type=float, default=1.0, help="Segundos entre lecturas.")
 
-    # FairPrice (tus parámetros)
+    # FairPrice
     ap.add_argument("--initial_price", type=float, default=0.5)
-    ap.add_argument("--process_variance", type=float, default=1e-5)     # Q base
-    ap.add_argument("--measurement_variance", type=float, default=1e-2) # R base
+    ap.add_argument("--process_variance", type=float, default=1e-5)      # Q base
+    ap.add_argument("--measurement_variance", type=float, default=1e-2)  # R base
     ap.add_argument("--initial_variance", type=float, default=1.0)
     ap.add_argument("--clip01", action="store_true")
 
-    # SpreadCalculator (tuyos)
+    # SpreadCalculator
     ap.add_argument("--gamma", type=float, default=0.15)
     ap.add_argument("--lam", type=float, default=0.6)
     ap.add_argument("--window", type=int, default=50)
@@ -250,12 +304,11 @@ def main():
 
     args = ap.parse_args()
 
-    # Resolución de token_id (y opción de listar outcomes)
+    # ===== Listado de outcomes (sin operar) =====
     if args.list_outcomes:
         if args.token_id:
             print("Con --token_id no hay outcomes que listar (ya es un único outcome).")
             return
-        market = None
         if args.url:
             parsed = parse_polymarket_url(args.url)
             if "slug" not in parsed:
@@ -271,53 +324,83 @@ def main():
             print(f"[{i}] {o} -> {mapping[o]}")
         return
 
+    # ===== Resolver token_id =====
     token_id = resolve_token_id(args)
     if args.debug:
         print(f"[debug] token_id={token_id}")
 
-    # Instancias (tus clases)
+    # ===== Instancias (tus clases) =====
+    # FairPrice: más memoria en Q dinámica (sin tocar fechas)
     kf = FairPrice(
         initial_price=args.initial_price,
         process_variance=args.process_variance,
         measurement_variance=args.measurement_variance,
         initial_variance=args.initial_variance,
-        clip_prob=args.clip01
+        clip_prob=args.clip01,    # alias de clip01 aceptado por tu clase
+        # tuning de micro-vol (si tu FairPrice los soporta)
+        q_alpha=0.10,
+        q_gain=0.15
     )
+
+    # Spread: más memoria y sensibilidad micro
     sc = SpreadCalculator(
         gamma=args.gamma,
         lam=args.lam,
-        window=args.window,
-        min_spread=args.min_spread,
-        inv_skew_scale=args.inv_skew_scale
+        window=200,          # horizonte lógico mayor
+        ewma_alpha=0.15,     # sigma más memoriosa
+        k_spread=0.35,
+        k_imb=0.015,
+        edge_k=0.30,
+        hard_max=0.20
     )
 
-    # buffers
-    times, mids, fairs, fair_vars, bidq, askq, best_bids, best_asks = [], [], [], [], [], [], [], []
-    t0 = time.time()
-    last_mid = None
+    # ===== Buffers de serie =====
+    times: List[float] = []
+    mids: List[float] = []
+    fairs: List[float] = []
+    fair_vars: List[float] = []
+    bidq: List[float] = []
+    askq: List[float] = []
+    best_bids: List[Optional[float]] = []
+    best_asks: List[Optional[float]] = []
 
+    t0 = time.time()
+    last_mid: Optional[float] = None
+
+    # ===== Loop principal =====
     for i in range(args.samples):
         bb, ba = get_best_bid_ask(token_id, debug=args.debug)
         mid = safe_mid(bb, ba, last_mid, args.initial_price)
 
-        # Fair price: usa tu helper que ajusta Q/R con spread y micro-vol si hay bb y ba
+        # Fair price
         if bb is not None and ba is not None:
             fair, var = kf.update_from_orderbook(bb, ba)
         else:
             fair, var = kf.update(mid)
 
-        # Cálculo de cotizaciones (Avellaneda–Stoikov)
+        # Microestructura para spread
+        if bb is not None and ba is not None:
+            sc.update_micro(best_bid=bb, best_ask=ba)
+
+        # Cotizaciones (Avellaneda–Stoikov)
         bid, ask, full = sc.quotes(fair=fair, fair_var=var, inv=args.inv, inv_limit=args.inv_limit)
 
         # almacenar
         now = time.time() - t0
-        times.append(now); mids.append(mid); fairs.append(fair); fair_vars.append(var)
-        bidq.append(bid); askq.append(ask); best_bids.append(bb if bb is not None else "")
+        times.append(now)
+        mids.append(mid)
+        fairs.append(fair)
+        fair_vars.append(var)
+        bidq.append(bid)
+        askq.append(ask)
+        best_bids.append(bb if bb is not None else "")
         best_asks.append(ba if ba is not None else "")
 
         if args.debug:
-            print(f"[{i+1}/{args.samples}] mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
-                  f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba}")
+            print(
+                f"[{i+1}/{args.samples}] mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
+                f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba}"
+            )
 
         last_mid = mid
         if i < args.samples - 1:
@@ -332,22 +415,28 @@ def main():
     print(f"✅ Serie temporal guardada en: {args.csv}")
 
     # ===== Gráfica =====
-    plt.figure(figsize=(10,5))
+    plt.figure(figsize=(10, 5))
     plt.plot(times, mids, label="Mid observado")
     plt.plot(times, fairs, label="Fair price (Kalman)")
     plt.plot(times, bidq, label="Bid cotizado")
     plt.plot(times, askq, label="Ask cotizado")
     plt.ylim(0.0, 1.0)
-    plt.xlabel("Tiempo (s)"); plt.ylabel("Precio")
+    plt.xlabel("Tiempo (s)")
+    plt.ylabel("Precio")
     plt.title("Fair price (Kalman) + Avellaneda–Stoikov | Polymarket")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
     plt.savefig(args.png, dpi=150)
     print(f"📈 Gráfica guardada en: {args.png}")
 
     # ===== Resumen corto para el pitch =====
-    avg_spread = sum(a-b for a,b in zip(askq, bidq)) / max(1,len(bidq))
-    drift = (fairs[-1]-fairs[0]) if fairs else 0.0
+    avg_spread = sum(a - b for a, b in zip(askq, bidq)) / max(1, len(bidq))
+    drift = (fairs[-1] - fairs[0]) if fairs else 0.0
     print(f"Resumen → spread_medio={avg_spread:.4f} | drift_fair={drift:+.4f}")
 
 if __name__ == "__main__":
     main()
+
+
+
