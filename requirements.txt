@@ -1,18 +1,7 @@
-# Dependencias base del proyecto
 py-clob-client
 python-dotenv
-
-# Networking y requests HTTP
 requests>=2.31.0
 urllib3>=2.0.0
-
-# Visualización (usar pip o pip3 según el entorno)
-matplotlib>=3.8.0
-
-# Tipado y utilidades
-typing-extensions
-
-# Compatibilidad estadística (para versiones <3.10)
-statistics; python_version < '3.10'
+matplotlib>=3.8
 
 
