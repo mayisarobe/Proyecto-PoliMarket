@@ -1,7 +1,31 @@
+# Sensibles / locales
 .env
-.conda
-.venv
-__pycache__\
-polimarket
-client.cpython-312.pyc
-fairprice.cpython-312.pyc
+.env.*
+*.key
+*.pem
+
+# Python cache y binarios
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Entornos
+.venv/
+venv/
+conda/
+.conda/
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Artefactos del proyecto
+mm_results.png
+mm_timeseries.csv
+live_book_*.csv
+
