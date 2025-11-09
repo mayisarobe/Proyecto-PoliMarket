@@ -1,169 +1,156 @@
 # spread.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Tuple, Optional
-import math
 
-class _Ewma:
-    def __init__(self, alpha: float = 0.2, init: Optional[float] = None):
-        self.alpha = float(alpha)
-        self.state = init
-    def update(self, x: float) -> float:
-        x = float(x)
-        self.state = x if self.state is None else self.alpha * x + (1 - self.alpha) * self.state
-        return self.state if self.state is not None else x
+from typing import Dict, List, Optional, Tuple
+
 
 class SpreadCalculator:
     """
-    Avellaneda–Stoikov mejorado (prob space [0,1]) con señales de microestructura.
+    Calculadora de spreads (Avellaneda–Stoikov “lite”) adaptada a Polymarket.
 
-    Parámetros claves
-    -----------------
-    gamma: aversión al riesgo (↑ → spreads más anchos)
-    lam: intensidad de llegada de órdenes (↑ → spreads más estrechos)
-    window: tamaño de ventana lógica (se usa vía EWMA; no hace falta exactamente)
-    min_spread: piso de spread total
-    inv_skew_scale: escala del sesgo por inventario
-    ewma_alpha: suavizado de retornos para sigma
-    k_spread: cuánto contribuye el spread del libro al spread cotizado
-    k_imb: cuánto contribuye el imbalance al spread cotizado
-    edge_k: ensancha spreads cerca de 0/1
-    hard_max: tope de spread para no alejarse demasiado
+    - Usa una señal de microestructura vía EWMA de |Δmid| (update_micro).
+    - Mezcla esa señal con la varianza del fair (fair_var) para estimar sigma.
+    - Aplica un spread base dependiente de sigma, con piso (min_spread)
+      y un suavizado hacia los bordes (edge_k).
+    - Desplaza el centro (reservation price) por inventario (inv / inv_limit),
+      escalado por inv_skew_scale * k_imb.
+
+    Parámetros principales
+    ----------------------
+    gamma : float
+        Aversión al riesgo (se usa como “peso” implícito en el spread).
+    lam : float
+        Intensidad de llegada de órdenes (no se usa de forma explícita en esta
+        versión “lite”, pero queda para extensiones si lo necesitás).
+    window : int
+        Longitud de ventana lógica para el tracking de microestructura.
+    ewma_alpha : float
+        Factor de suavizado para EWMA(|Δmid|). [0,1], más alto = reactividad mayor.
+    k_spread : float
+        Ganancia para mapear sigma → spread.
+    k_imb : float
+        Ganancia del sesgo por inventario.
+    edge_k : float
+        Aumento de spread cerca de los bordes (0 o 1), en función de min(fair, 1-fair).
+    hard_max : float
+        Techo duro del spread (por seguridad).
+    min_spread : float
+        Piso mínimo del spread (prob space [0,1]).
+    inv_skew_scale : float
+        Escala adicional del sesgo por inventario (permite “afilar” o “suavizar” el skew).
     """
 
     def __init__(
         self,
-        gamma: float = 0.15,
-        lam: float = 0.6,
-        window: int = 50,
+        gamma: float,
+        lam: float,
+        window: int = 100,
+        ewma_alpha: float = 0.20,
+        k_spread: float = 0.35,
+        k_imb: float = 0.015,
+        edge_k: float = 0.30,
+        hard_max: float = 0.20,
         min_spread: float = 0.003,
         inv_skew_scale: float = 1.0,
-        ewma_alpha: float = 0.25,
-        k_spread: float = 0.30,
-        k_imb: float = 0.01,
-        edge_k: float = 0.25,
-        hard_max: float = 0.15,
-    ):
+    ) -> None:
+        # Hiperparámetros
         self.gamma = float(gamma)
         self.lam = float(lam)
         self.window = int(window)
-        self.min_spread = float(min_spread)
-        self.inv_skew_scale = float(inv_skew_scale)
         self.ewma_alpha = float(ewma_alpha)
         self.k_spread = float(k_spread)
         self.k_imb = float(k_imb)
         self.edge_k = float(edge_k)
         self.hard_max = float(hard_max)
+        self.min_spread = float(min_spread)
+        self.inv_skew_scale = float(inv_skew_scale)
 
-        # estado
-        self._fair_prev: Optional[float] = None
-        self._r_ewma = _Ewma(alpha=self.ewma_alpha, init=0.0)  # EWMA de retornos (dfair)
-        self._last_book_spread: float = 0.0
-        self._last_imb: float = 0.0  # |imb| en [0,1]
+        # Estado interno (microestructura)
+        self._last_mid: Optional[float] = None
+        self._ewma_abs_dmid: float = 0.0  # EWMA de |Δmid|
+        self._mids: List[float] = []      # histórico corto, por si querés extender
 
-        # buffer de fairs por compatibilidad (no lo usamos duro)
-        self._recent_fairs: List[float] = []
-
-    # ---------- helpers ----------
+    # ---------------- utils ----------------
     @staticmethod
     def _clip01(x: float) -> float:
-        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+        if x < 0.0:
+            return 0.0
+        if x > 1.0:
+            return 1.0
+        return x
 
-    @staticmethod
-    def _imbalance(bid_sz: float, ask_sz: float) -> float:
-        den = max(1e-9, bid_sz + ask_sz)
-        return (bid_sz - ask_sz) / den  # [-1, 1]
-
-    def update_micro(self, best_bid: Optional[float], best_ask: Optional[float],
-                     bid_size: Optional[float] = None, ask_size: Optional[float] = None) -> None:
+    # ---------------- API micro ----------------
+    def update_micro(self, best_bid: float, best_ask: float) -> None:
         """
-        Llamá a esto por tick si querés que el spread refleje el libro:
-        - Guarda el último spread del libro (ask-bid).
-        - Guarda |imbalance| de tamaños (opcional).
+        Actualiza señales de microestructura a partir del mejor bid/ask.
+        - mid = (bid + ask) / 2
+        - EWMA(|Δmid|) como proxy de micro-volatilidad intradía.
         """
-        if best_bid is not None and best_ask is not None:
-            self._last_book_spread = max(0.0, float(best_ask) - float(best_bid))
-        if bid_size is not None and ask_size is not None:
-            self._last_imb = abs(self._imbalance(float(bid_size), float(ask_size)))
+        bid = float(best_bid)
+        ask = float(best_ask)
+        if ask < bid:
+            ask = bid
 
-    def _sigma_from_fair(self, fair: float) -> float:
-        # retorno simple dfair
-        if self._fair_prev is None:
-            self._fair_prev = float(fair)
-            r = 0.0
+        mid = 0.5 * (bid + ask)
+
+        if self._last_mid is None:
+            self._ewma_abs_dmid = 0.0
         else:
-            r = float(fair) - float(self._fair_prev)
-            self._fair_prev = float(fair)
-        # EWMA de |retorno| como proxy de sigma (rápido, robusto)
-        sig = self._r_ewma.update(abs(r))
-        # piso conservador
-        return max(sig, 0.005)
+            d = abs(mid - self._last_mid)
+            a = self.ewma_alpha
+            self._ewma_abs_dmid = (1.0 - a) * self._ewma_abs_dmid + a * d
 
-    def _half_spread_base(self, sigma: float) -> float:
-        # fórmula Avellaneda–Stoikov aproximada
-        return (self.gamma * sigma * sigma) / max(1e-6, 2.0 * self.lam)
+        self._last_mid = mid
+        self._mids.append(mid)
+        if len(self._mids) > self.window:
+            self._mids.pop(0)
 
-    def _reservation_price(self, fair: float, sigma: float, inv: float, inv_limit: float) -> float:
-        # sesgo con tanh para no desbocar en extremos
-        ratio = float(inv) / max(1.0, float(inv_limit))
-        skew = self.inv_skew_scale * self.gamma * sigma * sigma * math.tanh(3.0 * ratio)
-        return fair - skew
-
-    # ---------- API pública ----------
-    def quotes(self, fair: float, fair_var: float, inv: float, inv_limit: float) -> Tuple[float, float, float]:
+    # ---------------- API principal ----------------
+    def quotes(
+        self,
+        fair: float,
+        fair_var: float,
+        inv: float = 0.0,
+        inv_limit: float = 30.0,
+    ) -> Tuple[float, float, Dict[str, float]]:
         """
-        Devuelve (bid, ask, full_spread). Compatible con tu main.py.
-        Si no llamaste update_micro(), usa valores neutros (spread libro=0, |imb|=0).
+        Devuelve (bid, ask, meta) donde meta contiene:
+            - spread: spread final aplicado
+            - skew  : desplazamiento por inventario
+            - sigma : volatilidad efectiva usada
         """
         fair = float(fair)
-        self._recent_fairs.append(fair)
+        fair_var = float(fair_var)
+        inv = float(inv)
+        inv_limit = max(float(inv_limit), 1e-6)
 
-        # 1) sigma por EWMA de retornos del fair
-        sigma = self._sigma_from_fair(fair)
+        # 1) Sigma efectiva: mezcla fair_var y micro EWMA(|Δmid|)
+        sigma_from_fair = fair_var ** 0.5 if fair_var > 0.0 else 0.0
+        sigma_micro = self._ewma_abs_dmid
+        sigma = max(sigma_from_fair, sigma_micro, 1e-8)  # evitá cero
 
-        # 2) base half-spread Avellaneda–Stoikov
-        half = self._half_spread_base(sigma)
+        # 2) Spread base con borde y límites
+        edge_boost = self.edge_k * min(fair, 1.0 - fair)  # +spread cerca de 0/1
+        spread = self.k_spread * sigma + edge_boost
+        spread = max(self.min_spread, min(self.hard_max, spread))
 
-        # 3) microestructura: añadimos contribuciones
-        half += 0.5 * ( self.k_spread * self._last_book_spread + self.k_imb * self._last_imb )
+        # 3) Sesgo por inventario (reservation price shift)
+        skew = self.inv_skew_scale * self.k_imb * (inv / inv_limit)
+        r = fair - skew
 
-        # 4) widen near edges (cerca de 0/1)
-        edge_factor = 1.0 + self.edge_k * (1.0 - 2.0 * abs(fair - 0.5))  # ~1.25 en 0/1, ~1.0 en 0.5
-        half *= edge_factor
-
-        # 5) reservation price con inventario (tanh)
-        r = self._reservation_price(fair, sigma, inv, inv_limit)
-
-        # 6) cotizaciones y guardas
+        # 4) Cotizaciones
+        half = 0.5 * spread
         bid = self._clip01(r - half)
         ask = self._clip01(r + half)
-        full = max(0.0, ask - bid)
 
-        # 7) mínimos y máximos
-        if full < self.min_spread:
-            half = self.min_spread / 2.0
+        # Garantía de min_spread tras clip
+        if ask - bid < self.min_spread:
+            half = 0.5 * self.min_spread
             bid = self._clip01(r - half)
             ask = self._clip01(r + half)
-            full = ask - bid
 
-        full = min(full, self.hard_max)
+        # Meta útil para debugging/reportes
+        meta = {"spread": float(ask - bid), "skew": float(skew), "sigma": float(sigma)}
+        return bid, ask, meta
 
-        # 8) anticrossing (por si el clip01 generó cruce)
-        if bid >= ask:
-            mid = (bid + ask) / 2.0
-            bid = self._clip01(mid - self.min_spread / 2.0)
-            ask = self._clip01(mid + self.min_spread / 2.0)
-            full = ask - bid
-
-        return bid, ask, full
-
-
-# --- ejemplo mínimo ---
-if __name__ == "__main__":
-    sc = SpreadCalculator(gamma=0.15, lam=0.6, window=50, min_spread=0.003)
-    fair_series = [0.50, 0.51, 0.49, 0.52, 0.51, 0.50]
-    inv, inv_limit = 5.0, 30.0
-    for i, f in enumerate(fair_series):
-        # ejemplo de microestructura opcional
-        sc.update_micro(best_bid=0.49, best_ask=0.51, bid_size=100, ask_size=120)
-        bid, ask, full = sc.quotes(fair=f, fair_var=1e-4, inv=inv, inv_limit=inv_limit)
-        print(f"t={i:02d} fair={f:.3f} | bid={bid:.3f} ask={ask:.3f} spread={full:.4f}")
