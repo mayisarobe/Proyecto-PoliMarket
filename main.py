@@ -281,7 +281,7 @@ def main():
         process_variance=args.process_variance,
         measurement_variance=args.measurement_variance,
         initial_variance=args.initial_variance,
-        clip01=args.clip01
+        clip_prob=args.clip01
     )
     sc = SpreadCalculator(
         gamma=args.gamma,

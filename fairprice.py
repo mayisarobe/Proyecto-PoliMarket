@@ -1,117 +1,205 @@
+# fairprice.py
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Iterable, Tuple
+import math
+import time
+
+def clip01(x: float) -> float:
+    return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+def ob_imbalance(bid_size: float, ask_size: float) -> float:
+    """(B - A) / (B + A) ∈ [-1,1]"""
+    den = max(1e-12, bid_size + ask_size)
+    return (bid_size - ask_size) / den
+
+class Ewma:
+    def __init__(self, alpha: float, init: float = 0.0):
+        self.alpha = float(alpha)
+        self.state = float(init)
+        self.ready = False
+    def update(self, x: float) -> float:
+        if not self.ready:
+            self.state = float(x)
+            self.ready = True
+        else:
+            self.state = self.alpha * float(x) + (1 - self.alpha) * self.state
+        return self.state
 
 class FairPrice:
     """
-    Kalman 1D para precio justo.
-    - Interfaz drop-in con tus parámetros.
-    - Corrige: update retorna (x, P) y aplica clip01.
-    - Opcional: update_from_orderbook() ajusta R con el spread y Q con una EWMA de |Δmid|.
+    Filtro de Kalman 1D con Q y R adaptativos + gating de outliers.
+    Métodos:
+      - update(z) -> (x, P)
+      - predict() -> x
+      - update_from_orderbook(bid, ask, bid_sz=1.0, ask_sz=1.0, trade_lambda=None)
+      - update_series(observations)  # batch simple
     """
 
     def __init__(
         self,
-        initial_price: float = 0.0,
-        process_variance: float = 1e-5,       # Q base
-        measurement_variance: float = 1e-2,   # R base
-        initial_variance: float = 1.0,        # P0
-        clip01: bool = False,
-        eps: float = 1e-12
+        initial_price: float = 0.50,
+        initial_variance: float = 1.0,     # P0
+        process_variance: float = 1e-4,    # Q base
+        measurement_variance: float = 1e-3,# R base
+        clip_prob: bool = True,
+        eps: float = 1e-12,
+
+        # ---- Adaptativos ----
+        # R = max(r_min, (r_k * spread)^2) * (1 + r_imb_k * |imb|)
+        r_k: float = 0.8,
+        r_min: float = 1e-6,
+        r_imb_k: float = 0.3,              # sensibilidad a desequilibrio libro
+
+        # Q = Q_base + q_gain * (EWMA(|Δmid|))^2 * (1 + q_lambda_k * λ_trades)
+        q_alpha: float = 0.2,              # suavizado de micro-vol
+        q_gain: float = 0.2,
+        q_lambda_k: float = 0.2,           # opcional: impacto de intensidad de trades
+
+        # ---- Outlier gating ----
+        innovation_zscore_max: float = 4.0,  # rechaza innovaciones > zσ
+
+        # ---- Warm-up ----
+        warmup_steps: int = 5              # durante warmup no gatea
     ):
-        self.x = float(initial_price)         # posterior mean
-        self.P = float(initial_variance)      # posterior var
-        self.Q = float(process_variance)
-        self.R = float(measurement_variance)
-        self.clip01 = bool(clip01)
+        # estado KF
+        self.x = float(initial_price)
+        self.P = float(initial_variance)
+        self.Q0 = float(process_variance)
+        self.R0 = float(measurement_variance)
+        self.Q = self.Q0
+        self.R = self.R0
+
+        # config
+        self.clip_prob = bool(clip_prob)
         self.eps = float(eps)
 
-        # Estado auxiliar para ruidos dinámicos (opcional)
+        # adaptativos
+        self.r_k = float(r_k)
+        self.r_min = float(r_min)
+        self.r_imb_k = float(r_imb_k)
+        self.q_gain = float(q_gain)
+        self.q_lambda_k = float(q_lambda_k)
+
+        self._ewma_abs_dmid = Ewma(alpha=q_alpha, init=0.0)
         self._last_mid: Optional[float] = None
-        self._ewma_abs_dmid: float = 0.0
 
-        # Tuning por defecto para dinámicos
-        self.r_k: float = 0.5     # escala para spread → R = max(r_min, (r_k*spread)^2)
-        self.r_min: float = 1e-6
-        self.q_alpha: float = 0.1 # EWMA para |Δmid|
-        self.q_gain: float = 0.1  # cuánto contribuye la micro-vol al Q
+        # gating y warmup
+        self.zmax = float(innovation_zscore_max)
+        self.warmup_steps = int(warmup_steps)
+        self._steps = 0
 
-    # ---------- util ----------
+        # métricas simples
+        self.last_ts = time.time()
+        self.innov_var = self.R0 + self.P + self.eps  # inicial
+
+    # ----------------- utilidades internas -----------------
     def _maybe_clip(self, x: float) -> float:
-        if not self.clip01: return x
-        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+        return clip01(x) if self.clip_prob else float(x)
 
-    # ---------- API principal ----------
-    def update(self, z: float) -> tuple[float, float]:
-        """
-        Ingiere observación z y devuelve (fair_price, posterior_variance).
-        Usa Q y R actuales (fijos o los que hayas seteado antes).
-        """
+    def _adapt_R(self, spread: float, imb_abs: float) -> float:
+        r_spread = max(self.r_min, (self.r_k * max(0.0, spread)) ** 2)
+        return r_spread * (1.0 + self.r_imb_k * imb_abs)
+
+    def _adapt_Q(self, mid: float, trade_lambda: Optional[float]) -> float:
+        if self._last_mid is None:
+            micro = 0.0
+        else:
+            micro = abs(mid - self._last_mid)
+        vol = self._ewma_abs_dmid.update(micro)
+        q = self.Q0 + self.q_gain * (vol ** 2)
+        if trade_lambda is not None:  # λ en [0,∞), normalizado si querés
+            q *= (1.0 + self.q_lambda_k * float(trade_lambda))
+        self._last_mid = mid
+        return q
+
+    # ----------------- API pública -----------------
+    def update(self, z: float) -> Tuple[float, float]:
+        """Ingiere observación z, aplica gating y retorna (x, P)."""
         # Predict
         x_pred = self.x
         P_pred = self.P + self.Q
 
-        # Update
-        denom = P_pred + self.R + self.eps
-        K = P_pred / denom
-        self.x = x_pred + K * (float(z) - x_pred)
+        # Innovation
+        y = float(z) - x_pred
+        S = P_pred + self.R + self.eps  # var de la innovación
+        self.innov_var = S
+
+        # Gating (evita saltos absurdos salvo en warmup)
+        if self._steps > self.warmup_steps:
+            zscore = abs(y) / math.sqrt(max(self.eps, S))
+            if zscore > self.zmax:
+                # rechaza medición: solo propaga incertidumbre
+                self.x = x_pred
+                self.P = P_pred
+                self._steps += 1
+                return self._maybe_clip(self.x), self.P
+
+        # Update KF
+        K = P_pred / S
+        self.x = x_pred + K * y
         self.P = (1.0 - K) * P_pred
 
-        # Clip si es probabilidad
         self.x = self._maybe_clip(self.x)
+        self._steps += 1
         return self.x, self.P
 
     def predict(self) -> float:
-        """
-        Paso sin observación: solo aumenta la incertidumbre.
-        """
+        """Paso sin observación."""
         self.P += self.Q
-        return self.x
+        return self._maybe_clip(self.x)
 
-    def set_noise(self, process_variance: float | None = None, measurement_variance: float | None = None) -> None:
-        """Ajusta Q y/o R manualmente."""
+    def set_noise(self, process_variance: Optional[float] = None,
+                  measurement_variance: Optional[float] = None) -> None:
         if process_variance is not None:
-            self.Q = float(process_variance)
+            self.Q0 = float(process_variance)
+            self.Q = self.Q0
         if measurement_variance is not None:
-            self.R = float(measurement_variance)
+            self.R0 = float(measurement_variance)
+            self.R = self.R0
 
-    def reset(self, initial_price: float = 0.0, initial_variance: float = 1.0) -> None:
-        """Resetea estado y covarianza."""
+    def reset(self, initial_price: float = 0.50, initial_variance: float = 1.0) -> None:
         self.x = float(initial_price)
         self.P = float(initial_variance)
         self._last_mid = None
-        self._ewma_abs_dmid = 0.0
+        self._ewma_abs_dmid = Ewma(alpha=self._ewma_abs_dmid.alpha, init=0.0)
+        self._steps = 0
 
-    # ---------- Azúcar para usar con orderbook (opcional) ----------
-    def update_from_orderbook(self, best_bid: float, best_ask: float) -> tuple[float, float]:
+    def update_from_orderbook(
+        self,
+        best_bid: float,
+        best_ask: float,
+        bid_size: float = 1.0,
+        ask_size: float = 1.0,
+        trade_lambda: Optional[float] = None,
+    ) -> Tuple[float, float]:
         """
-        Construye z = mid y aplica ruidos dinámicos:
-          - R = max(r_min, (r_k * spread)^2)
-          - Q = Q_base + q_gain * (EWMA(|Δmid|))^2
-        Devuelve (x, P).
+        Convierte el libro en mid/spread y aplica Q,R adaptativos:
+          R = f(spread, imbalance)
+          Q = f(microvol, λ)
+        trade_lambda: intensidad de trades (p.ej., trades/seg normalizado)
         """
         b = float(best_bid)
         a = float(best_ask)
-        if a < b:  # libro roto → forzar no negativo
+        if a < b:  # arregla libro roto
             a = b
         mid = 0.5 * (a + b)
-        spread = max(a - b, 0.0)
+        spread = max(0.0, a - b)
+        imb = abs(ob_imbalance(bid_size, ask_size))
 
-        # Actualiza EWMA de micro-vol
-        if self._last_mid is None:
-            self._ewma_abs_dmid = 0.0
-        else:
-            d = abs(mid - self._last_mid)
-            self._ewma_abs_dmid = (1 - self.q_alpha) * self._ewma_abs_dmid + self.q_alpha * d
-        self._last_mid = mid
-
-        # Ajustes dinámicos
-        dyn_R = max(self.r_min, (self.r_k * spread) ** 2)
-        dyn_Q = self.Q + self.q_gain * (self._ewma_abs_dmid ** 2)
-
-        # Guardar temporalmente (si prefieres no pisar Q/R globales)
+        # adaptar ruidos para este tick (sin pisar los base)
         Q_prev, R_prev = self.Q, self.R
-        self.Q, self.R = dyn_Q, dyn_R
         try:
+            self.Q = self._adapt_Q(mid, trade_lambda)
+            self.R = self._adapt_R(spread, imb)
             return self.update(mid)
         finally:
             self.Q, self.R = Q_prev, R_prev
+
+    # batch opcional para una serie de mids
+    def update_series(self, mids: Iterable[float]) -> Iterable[Tuple[float, float]]:
+        out = []
+        for z in mids:
+            self.Q = self._adapt_Q(float(z), trade_lambda=None)
+            self.R = self.R0
+            out.append(self.update(float(z)))
+        return out
