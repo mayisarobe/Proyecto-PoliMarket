@@ -9,12 +9,14 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.so
+polimarket
 
 # Entornos
 .venv/
 venv/
 conda/
 .conda/
+
 
 # IDEs / OS
 .vscode/
