@@ -19,7 +19,9 @@ from spread import SpreadCalculator        # Avellaneda–Stoikov mejorado
 
 CLOB_BASE = "https://clob.polymarket.com"
 
-# ============ Sesión HTTP robusta (evita 429/HTML/Cloudflare) ============
+# ============================================================
+#          SESIÓN HTTP ROBUSTA (CONEXIÓN AL MERCADO)
+# ============================================================
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({
@@ -53,7 +55,9 @@ def http_get_json(url: str, timeout: int = 20):
         raise RuntimeError(f"No-JSON {r.status_code} {ct} body[:300]={snippet!r} url={url}")
     return r.json()
 
-# ============ Helpers de parsing ============
+# ============================================================
+#                 HELPERS DE PARSING / MERCADOS
+# ============================================================
 def _ensure_list(x):
     if isinstance(x, list):
         return x
@@ -88,7 +92,6 @@ def parse_polymarket_url(url: str) -> dict:
         out["slug"] = m.group(1)
     return out
 
-# ============ Resolver token_id desde /markets ============
 def _extract_markets_payload(obj) -> Optional[List[dict]]:
     """
     Devuelve lista de mercados desde distintas variantes de payload:
@@ -199,60 +202,91 @@ def resolve_token_id(args) -> str:
         return resolve_token_from_market(market, args.outcome, args.outcome_index)
     raise SystemExit("No se pudo resolver token_id (revisa parámetros).")
 
-# ============ Order book ============
-def _first_price(arr):
-    if not isinstance(arr, list) or not arr:
+# ============================================================
+#                      ORDER BOOK / MID
+# ============================================================
+def _best_price(levels, side: str):
+    """
+    levels: lista de niveles del libro (bids/asks) del CLOB.
+    side: "bid" o "ask".
+
+    Devuelve:
+      - para bids: max(price)
+      - para asks: min(price)
+    """
+    if not isinstance(levels, list) or not levels:
         return None
-    top = arr[0]
-    if isinstance(top, dict):
-        p = top.get("price") or top.get("px")
+
+    prices = []
+    for lvl in levels:
+        if isinstance(lvl, dict):
+            p = lvl.get("price") or lvl.get("px")
+        elif isinstance(lvl, (list, tuple)) and lvl:
+            p = lvl[0]
+        else:
+            p = None
+
         try:
-            return float(p) if p is not None else None
-        except Exception:
-            return None
-    if isinstance(top, (list, tuple)) and top:
-        try:
-            return float(top[0])
-        except Exception:
-            return None
-    return None
+            if p is not None:
+                prices.append(float(p))
+        except (TypeError, ValueError):
+            continue
+
+    if not prices:
+        return None
+
+    if side.lower() == "bid":
+        return max(prices)
+    else:  # "ask"
+        return min(prices)
+
 
 def get_best_bid_ask(token_id: str, debug: bool = False):
     """
-    Intenta varios endpoints del CLOB y devuelve (best_bid, best_ask) como floats o None.
+    Devuelve (best_bid, best_ask) como floats o None.
     """
-    for ep in ["orderbook", "book", "orders"]:
+    for ep in ["book", "orders"]:
         url = f"{CLOB_BASE}/{ep}?token_id={token_id}"
         try:
             data = http_get_json(url)
+            # --- Caso: /book (dict con bids/asks) ---
             if isinstance(data, dict):
                 bids = data.get("bids") or data.get("bid") or []
                 asks = data.get("asks") or data.get("ask") or []
-                bb = _first_price(bids)
-                ba = _first_price(asks)
+
+                bb = _best_price(bids, "bid")
+                ba = _best_price(asks, "ask")
+
                 if debug:
                     print(f"[debug] {ep}: bestBid={bb} bestAsk={ba}")
                 if bb is not None or ba is not None:
                     return bb, ba
+
+            # --- Caso: /orders (lista de órdenes crudas) ---
             elif isinstance(data, list):
-                # /orders devuelve lista simple de órdenes
-                bids = [o for o in data if str(o.get("side","")).lower()=="buy"]
-                asks = [o for o in data if str(o.get("side","")).lower()=="sell"]
+                bids = [o for o in data if str(o.get("side", "")).lower() == "buy"]
+                asks = [o for o in data if str(o.get("side", "")).lower() == "sell"]
+
                 bids.sort(key=lambda x: float(x.get("price") or x.get("px") or 0), reverse=True)
                 asks.sort(key=lambda x: float(x.get("price") or x.get("px") or 0))
+
                 bb = float(bids[0].get("price") or bids[0].get("px")) if bids else None
                 ba = float(asks[0].get("price") or asks[0].get("px")) if asks else None
+
                 if debug:
                     print(f"[debug] {ep}-list: bestBid={bb} bestAsk={ba}")
                 return bb, ba
+
         except Exception as e:
             if debug:
                 print(f"[debug] fallo {url}: {e}")
             time.sleep(0.5)
             continue
+
     return None, None
 
-# ============ Aux mid ============
+
+
 def safe_mid(bb, ba, last_mid: Optional[float], default_mid: float) -> float:
     if bb is None and ba is None:
         return last_mid if last_mid is not None else default_mid
@@ -262,12 +296,46 @@ def safe_mid(bb, ba, last_mid: Optional[float], default_mid: float) -> float:
         return max(0.01, min(0.99, bb + 0.01))
     return (bb + ba) / 2.0
 
-# ============ MAIN ============
+# ============================================================
+#          CLIENTE DE TRADING (ABSTRACTO / ENCHUFABLE)
+# ============================================================
+class TradingClient:
+    """
+    Capa fina para mandar órdenes.
+    Por defecto está en modo 'dry-run' y solo imprime.
+    Aquí puedes enchufar tu client real de Polymarket (API key, firma, etc).
+    """
+    def __init__(self, dry_run: bool = True):
+        self.dry_run = dry_run
+
+    def send_limit_order(self, token_id: str, side: str, price: float, size: float):
+        side = side.upper()
+        msg = f"[ORDER][LIMIT] token={token_id} side={side} px={price:.4f} size={size:.2f}"
+        if self.dry_run:
+            print(msg, " (dry-run, no enviada)")
+            return
+        self.client.create_order(token_id, side, price, size, reduce_only=False)
+        print(msg, " (ENVIADA REAL)")
+
+    def send_market_taker(self, token_id: str, side: str, size: float, ref_price: Optional[float] = None):
+        side = side.upper()
+        extra = f" ref_px={ref_price:.4f}" if ref_price is not None else ""
+        msg = f"[ORDER][MARKET-TAKER] token={token_id} side={side} size={size:.2f}{extra}"
+        if self.dry_run:
+            print(msg, " (dry-run, no enviada)")
+            return
+        # self.client.create_order(token_id, side, price=None, size=size, type='market', ...)
+        print(msg, " (ENVIADA REAL)")
+
+# ============================================================
+#                           MAIN
+# ============================================================
 def main():
     ap = argparse.ArgumentParser(
-        description="Polymarket MM: FairPrice(Kalman) + Avellaneda–Stoikov + CSV/Gráfica."
+        description="Polymarket MM: FairPrice(Kalman) + Avellaneda–Stoikov + CSV/Gráfica + modo live."
     )
 
+    # --- selección de mercado ---
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--token_id", type=str, help="Token ID decimal del CLOB (directo).")
     src.add_argument("--condition_id", type=str, help="ConditionId hex (0x...).")
@@ -277,18 +345,33 @@ def main():
     ap.add_argument("--outcome_index", type=int, help="Índice del outcome (si condition/url).")
     ap.add_argument("--list_outcomes", action="store_true", help="Solo listar outcomes/token_id y salir.")
 
-    # muestreo (más datos, mismo rango temporal)
-    ap.add_argument("--samples", type=int, default=3600, help="Número de lecturas (p.ej., 3600=1h a 1s).")
-    ap.add_argument("--interval", type=float, default=1.0, help="Segundos entre lecturas.")
+    # --- modo de operación ---
+    ap.add_argument("--mode", choices=["backtest", "live"], default="backtest",
+                    help="backtest = solo serie + CSV + plot; live = lógica de trading en tiempo real.")
+    ap.add_argument("--role", choices=["maker", "taker"], default="maker",
+                    help="maker = cotiza bid/ask; taker = ejecuta solo con edge.")
+    ap.add_argument("--order_size", type=float, default=10.0,
+                    help="Tamaño de la orden (en unidades del contrato).")
+    ap.add_argument("--dry_run", action="store_true",
+                    help="Si está activo, NO envía órdenes reales, solo imprime.")
+    ap.add_argument("--taker_edge", type=float, default=0.01,
+                    help="Edge mínimo (en probabilidad) para que el taker actúe (fair vs best bid/ask).")
 
-    # FairPrice
+    # --- muestreo (para backtest y para live logging) ---
+    ap.add_argument("--samples", type=int, default=3600,
+                    help="Número de lecturas en backtest (p.ej., 3600=1h a 1s).")
+    ap.add_argument("--interval", type=float, default=1.0, help="Segundos entre lecturas.")
+    ap.add_argument("--live_seconds", type=int, default=0,
+                    help="Duración en modo live (0 = infinito hasta Ctrl+C).")
+
+    # --- FairPrice ---
     ap.add_argument("--initial_price", type=float, default=0.5)
     ap.add_argument("--process_variance", type=float, default=1e-5)      # Q base
     ap.add_argument("--measurement_variance", type=float, default=1e-2)  # R base
     ap.add_argument("--initial_variance", type=float, default=1.0)
     ap.add_argument("--clip01", action="store_true")
 
-    # SpreadCalculator
+    # --- SpreadCalculator ---
     ap.add_argument("--gamma", type=float, default=0.15)
     ap.add_argument("--lam", type=float, default=0.6)
     ap.add_argument("--window", type=int, default=50)
@@ -297,7 +380,7 @@ def main():
     ap.add_argument("--inv_limit", type=float, default=30.0)
     ap.add_argument("--inv_skew_scale", type=float, default=1.0)
 
-    # salida
+    # --- salida backtest ---
     ap.add_argument("--png", type=str, default="mm_results.png")
     ap.add_argument("--csv", type=str, default="mm_timeseries.csv")
     ap.add_argument("--debug", action="store_true")
@@ -328,33 +411,33 @@ def main():
     token_id = resolve_token_id(args)
     if args.debug:
         print(f"[debug] token_id={token_id}")
+        print(f"[debug] mode={args.mode}, role={args.role}, dry_run={args.dry_run}")
 
     # ===== Instancias (tus clases) =====
-    # FairPrice: más memoria en Q dinámica (sin tocar fechas)
     kf = FairPrice(
         initial_price=args.initial_price,
         process_variance=args.process_variance,
         measurement_variance=args.measurement_variance,
         initial_variance=args.initial_variance,
-        clip_prob=args.clip01,    # alias de clip01 aceptado por tu clase
-        # tuning de micro-vol (si tu FairPrice los soporta)
+        clip_prob=args.clip01,
         q_alpha=0.10,
         q_gain=0.15
     )
 
-    # Spread: más memoria y sensibilidad micro
     sc = SpreadCalculator(
         gamma=args.gamma,
         lam=args.lam,
-        window=200,          # horizonte lógico mayor
-        ewma_alpha=0.15,     # sigma más memoriosa
+        window=200,
+        ewma_alpha=0.15,
         k_spread=0.35,
         k_imb=0.015,
         edge_k=0.30,
         hard_max=0.20
     )
 
-    # ===== Buffers de serie =====
+    client = TradingClient(dry_run=args.dry_run)
+
+    # ===== Buffers de serie (backtest y logging) =====
     times: List[float] = []
     mids: List[float] = []
     fairs: List[float] = []
@@ -367,8 +450,12 @@ def main():
     t0 = time.time()
     last_mid: Optional[float] = None
 
-    # ===== Loop principal =====
-    for i in range(args.samples):
+    # ============================================================
+    #                 LÓGICA DE UN PASO DE MERCADO
+    # ============================================================
+    def one_step(now: float):
+        nonlocal last_mid
+
         bb, ba = get_best_bid_ask(token_id, debug=args.debug)
         mid = safe_mid(bb, ba, last_mid, args.initial_price)
 
@@ -385,8 +472,7 @@ def main():
         # Cotizaciones (Avellaneda–Stoikov)
         bid, ask, full = sc.quotes(fair=fair, fair_var=var, inv=args.inv, inv_limit=args.inv_limit)
 
-        # almacenar
-        now = time.time() - t0
+        # ---- Registro de serie (para backtest / logging) ----
         times.append(now)
         mids.append(mid)
         fairs.append(fair)
@@ -398,45 +484,101 @@ def main():
 
         if args.debug:
             print(
-                f"[{i+1}/{args.samples}] mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
+                f"[step] t={now:.1f}s mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
                 f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba}"
             )
 
+        # ---- Estrategia de trading según rol ----
+        if args.mode == "live":
+            if args.role == "maker":
+                # Liquidity Provider: cotiza bid/ask alrededor del fair
+                print(f"[MAKER] quoting bid={bid:.4f}, ask={ask:.4f}, size={args.order_size}")
+                client.send_limit_order(token_id, "BUY", bid, args.order_size)
+                client.send_limit_order(token_id, "SELL", ask, args.order_size)
+
+            elif args.role == "taker":
+                # Liquidity Taker: ejecuta solo cuando hay edge suficiente
+                if bb is None or ba is None:
+                    return
+                # Edge: fair vs niveles del book
+                edge_buy = fair - ba      # si fair > ask ⇒ queremos comprar
+                edge_sell = bb - fair     # si bid > fair ⇒ queremos vender
+
+                acted = False
+                if edge_buy > args.taker_edge:
+                    print(f"[TAKER] BUY signal → fair={fair:.4f} > ask={ba:.4f} (edge={edge_buy:.4f})")
+                    # client.send_market_taker(token_id, "BUY", args.order_size, ref_price=ba)
+                    acted = True
+
+                if edge_sell > args.taker_edge:
+                    print(f"[TAKER] SELL signal → bid={bb:.4f} > fair={fair:.4f} (edge={edge_sell:.4f})")
+                    client.send_market_taker(token_id, "SELL", args.order_size, ref_price=bb)
+                    acted = True
+
+                if not acted and args.debug:
+                    print(f"[TAKER] No action, edges: buy={edge_buy:.4f}, sell={edge_sell:.4f}")
+
         last_mid = mid
-        if i < args.samples - 1:
+        if args.debug:
+            print(f"[mid] bb={bb} ba={ba} mid={mid}")
+
+
+    # ============================================================
+    #                     EJECUCIÓN SEGÚN MODO
+    # ============================================================
+    if args.mode == "backtest":
+        # ===== Loop principal de backtest =====
+        for i in range(args.samples):
+            now = time.time() - t0
+            one_step(now)
+            if i < args.samples - 1:
+                time.sleep(max(0.0, args.interval))
+
+        # ===== CSV =====
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["time_s","best_bid","best_ask","mid","fair","fair_var","quote_bid","quote_ask"])
+            for row in zip(times, best_bids, best_asks, mids, fairs, fair_vars, bidq, askq):
+                w.writerow(row)
+        print(f"✅ Serie temporal guardada en: {args.csv}")
+
+        # ===== Gráfica =====
+        plt.figure(figsize=(10, 5))
+        plt.plot(times, mids, label="Mid observado")
+        plt.plot(times, fairs, label="Fair price (Kalman)")
+        plt.plot(times, bidq, label="Bid cotizado")
+        plt.plot(times, askq, label="Ask cotizado")
+        plt.ylim(0.0, 1.0)
+        plt.xlabel("Tiempo (s)")
+        plt.ylabel("Precio")
+        plt.title("Fair price (Kalman) + Avellaneda–Stoikov | Polymarket")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(args.png, dpi=150)
+        print(f"📈 Gráfica guardada en: {args.png}")
+
+        # ===== Resumen corto para el pitch =====
+        avg_spread = sum(a - b for a, b in zip(askq, bidq)) / max(1, len(bidq))
+        drift = (fairs[-1] - fairs[0]) if fairs else 0.0
+        print(f"Resumen → spread_medio={avg_spread:.4f} | drift_fair={drift:+.4f}")
+
+    else:
+        # ===== MODO LIVE: estrategia de trading en tiempo real =====
+        print(f"🚀 Modo LIVE iniciado | role={args.role} | dry_run={args.dry_run} | order_size={args.order_size}")
+        start = time.time()
+        step_idx = 0
+        while True:
+            now = time.time() - t0
+            one_step(now)
+            step_idx += 1
             time.sleep(max(0.0, args.interval))
 
-    # ===== CSV =====
-    with open(args.csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["time_s","best_bid","best_ask","mid","fair","fair_var","quote_bid","quote_ask"])
-        for row in zip(times, best_bids, best_asks, mids, fairs, fair_vars, bidq, askq):
-            w.writerow(row)
-    print(f"✅ Serie temporal guardada en: {args.csv}")
+            if args.live_seconds > 0 and (time.time() - start) >= args.live_seconds:
+                print("⏱️ live_seconds alcanzado, saliendo de modo live.")
+                break
 
-    # ===== Gráfica =====
-    plt.figure(figsize=(10, 5))
-    plt.plot(times, mids, label="Mid observado")
-    plt.plot(times, fairs, label="Fair price (Kalman)")
-    plt.plot(times, bidq, label="Bid cotizado")
-    plt.plot(times, askq, label="Ask cotizado")
-    plt.ylim(0.0, 1.0)
-    plt.xlabel("Tiempo (s)")
-    plt.ylabel("Precio")
-    plt.title("Fair price (Kalman) + Avellaneda–Stoikov | Polymarket")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(args.png, dpi=150)
-    print(f"📈 Gráfica guardada en: {args.png}")
-
-    # ===== Resumen corto para el pitch =====
-    avg_spread = sum(a - b for a, b in zip(askq, bidq)) / max(1, len(bidq))
-    drift = (fairs[-1] - fairs[0]) if fairs else 0.0
-    print(f"Resumen → spread_medio={avg_spread:.4f} | drift_fair={drift:+.4f}")
+        # En live normalmente no guardas gráfico, pero tienes las series en memoria si quieres.
 
 if __name__ == "__main__":
     main()
-
-
-
