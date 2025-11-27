@@ -304,28 +304,79 @@ class TradingClient:
     Capa fina para mandar órdenes.
     Por defecto está en modo 'dry-run' y solo imprime.
     Aquí puedes enchufar tu client real de Polymarket (API key, firma, etc).
-    """
-    def __init__(self, dry_run: bool = True):
-        self.dry_run = dry_run
 
-    def send_limit_order(self, token_id: str, side: str, price: float, size: float):
+    NUEVO:
+    - require_approval: si True, pide confirmación manual por consola antes de enviar.
+    - send_* devuelve bool indicando si se ha enviado la orden.
+    """
+    def __init__(self, dry_run: bool = True, require_approval: bool = True):
+        self.dry_run = dry_run
+        self.require_approval = require_approval
+        self.client = None  # Aquí enchufarías tu SDK real
+
+    def _confirm(self, msg: str) -> bool:
+        """
+        Pide aprobación manual de la orden.
+        Si require_approval=False, aprueba siempre.
+        """
+        if not self.require_approval:
+            return True
+        ans = input(msg + " ¿Aprobar? [y/N] ").strip().lower()
+        return ans.startswith("y")
+
+    def send_limit_order(self, token_id: str, side: str, price: float, size: float) -> bool:
         side = side.upper()
         msg = f"[ORDER][LIMIT] token={token_id} side={side} px={price:.4f} size={size:.2f}"
+
         if self.dry_run:
             print(msg, " (dry-run, no enviada)")
-            return
-        self.client.create_order(token_id, side, price, size, reduce_only=False)
-        print(msg, " (ENVIADA REAL)")
+            return False
 
-    def send_market_taker(self, token_id: str, side: str, size: float, ref_price: Optional[float] = None):
+        if not self._confirm(msg):
+            print("[ORDER] Rechazada por el aprobador.")
+            return False
+
+        # self.client.create_order(token_id, side, price, size, reduce_only=False)
+        print(msg, " (ENVIADA REAL)")
+        return True
+
+    def send_market_taker(
+        self,
+        token_id: str,
+        side: str,
+        size: float,
+        ref_price: Optional[float] = None
+    ) -> bool:
         side = side.upper()
         extra = f" ref_px={ref_price:.4f}" if ref_price is not None else ""
         msg = f"[ORDER][MARKET-TAKER] token={token_id} side={side} size={size:.2f}{extra}"
+
         if self.dry_run:
             print(msg, " (dry-run, no enviada)")
-            return
+            return False
+
+        if not self._confirm(msg):
+            print("[ORDER] Rechazada por el aprobador.")
+            return False
+
         # self.client.create_order(token_id, side, price=None, size=size, type='market', ...)
         print(msg, " (ENVIADA REAL)")
+        return True
+
+    def cancel_open_orders(self, token_id: str):
+        """
+        Cancela todas las órdenes abiertas del token.
+        En real: aquí llamas a la API de cancelación masiva.
+        """
+        msg = f"[ORDER][CANCEL-ALL] token={token_id}"
+        if self.dry_run:
+            print(msg, " (dry-run, no cancelado en el exchange)")
+            return
+        # if not self._confirm(msg):
+        #     print("[ORDER] Cancelación rechazada por el aprobador.")
+        #     return
+        # self.client.cancel_all(token_id=token_id)
+        print(msg, " (CANCEL-ALL ENVIADA REAL)")
 
 # ============================================================
 #                           MAIN
@@ -356,6 +407,8 @@ def main():
                     help="Si está activo, NO envía órdenes reales, solo imprime.")
     ap.add_argument("--taker_edge", type=float, default=0.01,
                     help="Edge mínimo (en probabilidad) para que el taker actúe (fair vs best bid/ask).")
+    ap.add_argument("--auto_approve", action="store_true",
+                    help="Si se activa, no pide confirmación manual para ejecutar órdenes.")
 
     # --- muestreo (para backtest y para live logging) ---
     ap.add_argument("--samples", type=int, default=3600,
@@ -379,6 +432,12 @@ def main():
     ap.add_argument("--inv", type=float, default=0.0)
     ap.add_argument("--inv_limit", type=float, default=30.0)
     ap.add_argument("--inv_skew_scale", type=float, default=1.0)
+
+    # --- límites de riesgo / inventario (NUEVO) ---
+    ap.add_argument("--max_inventory", type=float, default=100.0,
+                    help="Límite absoluto de inventario (en contratos).")
+    ap.add_argument("--max_notional", type=float, default=100.0,
+                    help="Límite aproximado de exposición nocional (|pos|*precio).")
 
     # --- salida backtest ---
     ap.add_argument("--png", type=str, default="mm_results.png")
@@ -435,7 +494,10 @@ def main():
         hard_max=0.20
     )
 
-    client = TradingClient(dry_run=args.dry_run)
+    client = TradingClient(
+        dry_run=args.dry_run,
+        require_approval=not args.auto_approve
+    )
 
     # ===== Buffers de serie (backtest y logging) =====
     times: List[float] = []
@@ -450,11 +512,37 @@ def main():
     t0 = time.time()
     last_mid: Optional[float] = None
 
+    # ===== Estado de inventario / cash (NUEVO) =====
+    # Empiezas en args.inv por si quieres partir de una posición no nula
+    inventory: float = args.inv
+    cash: float = 0.0  # PnL acumulado en prob units (aprox f*pos)
+
+    def check_limits(side: str, size: float, price: float) -> bool:
+        """
+        Comprueba límites de inventario y exposición antes de mandar una orden.
+        """
+        nonlocal inventory
+        s = side.upper()
+        delta = size if s == "BUY" else -size
+        new_inv = inventory + delta
+        if abs(new_inv) > args.max_inventory:
+            if args.debug:
+                print(f"[RISK] Límite de inventario superado: {new_inv} > {args.max_inventory}")
+            return False
+
+        notional_after = abs(new_inv * price)
+        if notional_after > args.max_notional:
+            if args.debug:
+                print(f"[RISK] Límite nocional superado: {notional_after:.4f} > {args.max_notional:.4f}")
+            return False
+
+        return True
+
     # ============================================================
     #                 LÓGICA DE UN PASO DE MERCADO
     # ============================================================
     def one_step(now: float):
-        nonlocal last_mid
+        nonlocal last_mid, inventory, cash
 
         bb, ba = get_best_bid_ask(token_id, debug=args.debug)
         mid = safe_mid(bb, ba, last_mid, args.initial_price)
@@ -470,7 +558,13 @@ def main():
             sc.update_micro(best_bid=bb, best_ask=ba)
 
         # Cotizaciones (Avellaneda–Stoikov)
-        bid, ask, full = sc.quotes(fair=fair, fair_var=var, inv=args.inv, inv_limit=args.inv_limit)
+        # IMPORTANTE: pasamos el INVENTARIO actual para que ajuste el precio de reserva
+        bid, ask, full = sc.quotes(
+            fair=fair,
+            fair_var=var,
+            inv=inventory,
+            inv_limit=args.inv_limit
+        )
 
         # ---- Registro de serie (para backtest / logging) ----
         times.append(now)
@@ -485,35 +579,94 @@ def main():
         if args.debug:
             print(
                 f"[step] t={now:.1f}s mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
-                f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba}"
+                f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba} | "
+                f"inv={inventory:.2f} cash={cash:.2f}"
             )
 
         # ---- Estrategia de trading según rol ----
         if args.mode == "live":
             if args.role == "maker":
-                # Liquidity Provider: cotiza bid/ask alrededor del fair
-                print(f"[MAKER] quoting bid={bid:.4f}, ask={ask:.4f}, size={args.order_size}")
-                client.send_limit_order(token_id, "BUY", bid, args.order_size)
-                client.send_limit_order(token_id, "SELL", ask, args.order_size)
+                if bb is None or ba is None:
+                    if args.debug:
+                        print("[MAKER] Libro vacío, no coto.")
+                    last_mid = mid
+                    return
+
+                # Asegurar quotes dentro de [0.01, 0.99]
+                q_bid = max(0.01, min(0.99, bid))
+                q_ask = max(0.01, min(0.99, ask))
+
+                # Evitar quotes cruzadas
+                if q_bid >= q_ask:
+                    mid_raw = (bb + ba) / 2.0
+                    half_spread_min = 0.003
+                    q_bid = max(0.01, mid_raw - half_spread_min)
+                    q_ask = min(0.99, mid_raw + half_spread_min)
+
+                # Cancelamos órdenes anteriores antes de cotizar las nuevas
+                client.cancel_open_orders(token_id)
+
+                # Chequeo de límites antes de poner las órdenes
+                if args.debug:
+                    print(f"[MAKER] quoting bid={q_bid:.4f}, ask={q_ask:.4f}, size={args.order_size}")
+
+                # Para maker, el inventario real debería actualizarse con fills reales
+                # (por ahora asumimos que se gestiona fuera, aquí solo cotizamos)
+                if check_limits("BUY", args.order_size, q_bid):
+                    client.send_limit_order(token_id, "BUY", q_bid, args.order_size)
+                else:
+                    if args.debug:
+                        print("[MAKER] BID bloqueado por límites de riesgo.")
+
+                if check_limits("SELL", args.order_size, q_ask):
+                    client.send_limit_order(token_id, "SELL", q_ask, args.order_size)
+                else:
+                    if args.debug:
+                        print("[MAKER] ASK bloqueado por límites de riesgo.")
 
             elif args.role == "taker":
                 # Liquidity Taker: ejecuta solo cuando hay edge suficiente
                 if bb is None or ba is None:
+                    last_mid = mid
                     return
+
                 # Edge: fair vs niveles del book
                 edge_buy = fair - ba      # si fair > ask ⇒ queremos comprar
                 edge_sell = bb - fair     # si bid > fair ⇒ queremos vender
 
                 acted = False
-                if edge_buy > args.taker_edge:
-                    print(f"[TAKER] BUY signal → fair={fair:.4f} > ask={ba:.4f} (edge={edge_buy:.4f})")
-                    # client.send_market_taker(token_id, "BUY", args.order_size, ref_price=ba)
-                    acted = True
 
+                # BUY (tomar el ask)
+                if edge_buy > args.taker_edge:
+                    price = ba
+                    if check_limits("BUY", args.order_size, price):
+                        print(f"[TAKER] BUY signal → fair={fair:.4f} > ask={ba:.4f} (edge={edge_buy:.4f})")
+                        sent = client.send_market_taker(
+                            token_id, "BUY", args.order_size, ref_price=price
+                        )
+                        if sent:
+                            delta = args.order_size
+                            inventory += delta
+                            cash -= delta * price
+                            acted = True
+                    elif args.debug:
+                        print(f"[TAKER] BUY bloqueado por límites de riesgo (edge={edge_buy:.4f}).")
+
+                # SELL (pegar al bid)
                 if edge_sell > args.taker_edge:
-                    print(f"[TAKER] SELL signal → bid={bb:.4f} > fair={fair:.4f} (edge={edge_sell:.4f})")
-                    client.send_market_taker(token_id, "SELL", args.order_size, ref_price=bb)
-                    acted = True
+                    price = bb
+                    if check_limits("SELL", args.order_size, price):
+                        print(f"[TAKER] SELL signal → bid={bb:.4f} > fair={fair:.4f} (edge={edge_sell:.4f})")
+                        sent = client.send_market_taker(
+                            token_id, "SELL", args.order_size, ref_price=price
+                        )
+                        if sent:
+                            delta = -args.order_size
+                            inventory += delta
+                            cash -= delta * price
+                            acted = True
+                    elif args.debug:
+                        print(f"[TAKER] SELL bloqueado por límites de riesgo (edge={edge_sell:.4f}).")
 
                 if not acted and args.debug:
                     print(f"[TAKER] No action, edges: buy={edge_buy:.4f}, sell={edge_sell:.4f}")
@@ -521,7 +674,6 @@ def main():
         last_mid = mid
         if args.debug:
             print(f"[mid] bb={bb} ba={ba} mid={mid}")
-
 
     # ============================================================
     #                     EJECUCIÓN SEGÚN MODO
