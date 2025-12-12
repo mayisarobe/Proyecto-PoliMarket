@@ -1,1 +1,33 @@
+# Sensibles / locales
 .env
+.env.*
+*.key
+*.pem
+
+# Python cache y binarios
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+polimarket
+
+# Entornos
+.venv/
+venv/
+conda/
+.conda/
+
+
+# IDEs / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Artefactos del proyecto
+mm_results.png
+mm_timeseries.csv
+live_book_*.csv
+
