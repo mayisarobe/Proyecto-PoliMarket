@@ -38,7 +38,7 @@ class PolymarketClient:
 
         if auto_auth:
             creds = self.c.create_or_derive_api_creds()
-            self.c.set_api_creds(creds)
+            self.c.set_api_creds(creds) # Autenticación automática
 
     
 
