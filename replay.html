@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Replay — Kalman + Quotes</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    :root{
+      --bg:#0a0f1a;
+      --panel:rgba(255,255,255,.06);
+      --stroke:rgba(255,255,255,.12);
+      --muted:rgba(255,255,255,.70);
+      --text:rgba(255,255,255,.92);
+      --pill:rgba(255,255,255,.08);
+      --accent:#b04cff;
+    }
+    body{
+      margin:0;
+      font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;
+      background:radial-gradient(1200px 700px at 20% 0%, #101a2e 0%, var(--bg) 55%);
+      color:var(--text)
+    }
+    .wrap{max-width:1100px;margin:0 auto;padding:18px}
+    .card{
+      background:var(--panel);
+      border:1px solid var(--stroke);
+      border-radius:18px;
+      overflow:hidden;
+      box-shadow:0 20px 60px rgba(0,0,0,.35)
+    }
+    .top{
+      display:flex;justify-content:space-between;align-items:center;gap:12px;
+      padding:14px 14px 10px;border-bottom:1px solid rgba(255,255,255,.08)
+    }
+    h1{font-size:16px;margin:0;font-weight:750}
+    .sub{font-size:12px;color:var(--muted);margin-top:4px}
+    .controls{
+      display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end
+    }
+    .btn, .chip{
+      background:var(--pill);
+      border:1px solid rgba(255,255,255,.10);
+      padding:8px 10px;border-radius:999px;
+      font-size:12px;color:var(--muted)
+    }
+    .btn{cursor:pointer;user-select:none}
+    .btn:active{transform:translateY(1px)}
+    .chip b{color:var(--text);font-weight:700}
+    input[type="range"]{width:170px}
+    .tog{display:flex;gap:10px;flex-wrap:wrap;padding:0 14px 12px}
+    .tog label{
+      display:flex;gap:8px;align-items:center;
+      background:var(--pill);
+      border:1px solid rgba(255,255,255,.10);
+      padding:8px 10px;border-radius:999px;
+      font-size:12px;color:var(--muted)
+    }
+    .tog input{accent-color:var(--accent)}
+    .chart{padding:10px 10px 14px}
+    #chart{height:560px}
+    #status{padding:0 14px 12px;color:var(--muted);font-size:12px}
+    .sep{opacity:.35;padding:0 4px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="top">
+      <div>
+        <h1>Replay (datos reales del bot)</h1>
+        <div class="sub">Auto-carga <code style="color:rgba(255,255,255,.85)">replay.csv</code> (si existe) y lo reproduce como “streaming”.</div>
+      </div>
+      <div class="controls">
+        <label class="btn">
+          Cargar CSV
+          <input id="file" type="file" accept=".csv" style="display:none">
+        </label>
+
+        <div class="btn" id="reloadBtn" title="Releer replay.csv">⟳ Recargar</div>
+
+        <label class="chip" style="display:flex;align-items:center;gap:8px;">
+          <input id="autoRefresh" type="checkbox" style="accent-color:var(--accent)">
+          Auto-refresh (2s)
+        </label>
+
+        <div class="btn" id="playBtn" title="Play/Pause">▶ Play</div>
+
+        <div class="chip">
+          Speed
+          <input id="speed" type="range" min="3" max="80" value="25">
+          <b><span id="speedVal">25</span>/s</b>
+        </div>
+
+        <div class="chip">
+          Ventana
+          <input id="win" type="range" min="50" max="4000" value="220">
+          <b><span id="winVal">220</span></b>
+        </div>
+      </div>
+    </div>
+
+    <div class="tog">
+      <label><input id="midCB" type="checkbox" checked> Mid</label>
+      <label><input id="fairCB" type="checkbox" checked> Kalman</label>
+      <label><input id="bidCB" type="checkbox" checked> Quote Bid</label>
+      <label><input id="askCB" type="checkbox" checked> Quote Ask</label>
+      <label><input id="bbCB"  type="checkbox" checked> Best Bid (mkt)</label>
+      <label><input id="baCB"  type="checkbox" checked> Best Ask (mkt)</label>
+      <label><input id="bandCB" type="checkbox" checked> Banda mercado</label>
+    </div>
+
+    <div id="status">
+      Estado: intentando auto-cargar… (columnas esperadas: ts,best_bid,best_ask,mid,fair,bid,ask,spread,inventory)
+    </div>
+
+    <div class="chart"><div id="chart"></div></div>
+  </div>
+</div>
+
+<script>
+/** ========= CONFIG ========= **/
+const AUTOLOAD_URL = "replay.csv";   // ruta relativa desde replay.html
+const AUTORELOAD_MS = 2000;               // 2s
+
+/** ========= DOM ========= **/
+const el = id => document.getElementById(id);
+const file = el("file");
+const playBtn = el("playBtn");
+const reloadBtn = el("reloadBtn");
+const autoRefresh = el("autoRefresh");
+
+const speed = el("speed"), speedVal = el("speedVal");
+const win = el("win"), winVal = el("winVal");
+const status = el("status");
+
+const cbs = {
+  mid:  el("midCB"),
+  fair: el("fairCB"),
+  bid:  el("bidCB"),
+  ask:  el("askCB"),
+  bb:   el("bbCB"),
+  ba:   el("baCB"),
+  band: el("bandCB"),
+};
+
+/** ========= STATE ========= **/
+let dataAll = null;
+let idx = 0;
+let timer = null;
+let playing = false;
+
+let autoTimer = null;
+let lastLoadedRows = 0;
+
+/** ========= CSV PARSER ========= **/
+function parseCSV(text){
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim().length > 0);
+  if(lines.length < 2) throw new Error("CSV vacío o sin filas");
+
+  const header = lines[0].split(",").map(s => s.trim());
+
+  const rows = lines.slice(1).map(l => {
+    const parts = l.split(",").map(s => s.trim());
+    const obj = {};
+    header.forEach((h,i)=> obj[h]=parts[i]);
+    return obj;
+  });
+
+  const get = (r, k) => r[k];
+  const toNum = v => (v===undefined || v===null || v==="") ? null : Number(v);
+
+  const x = rows.map((r,i)=> get(r,"ts") || i);
+
+  const mid  = rows.map(r=>toNum(get(r,"mid")));
+  const fair = rows.map(r=>toNum(get(r,"fair")));
+
+  const qbid = rows.map(r=>toNum(get(r,"bid")));
+  const qask = rows.map(r=>toNum(get(r,"ask")));
+
+  const bb   = rows.map(r=>toNum(get(r,"best_bid")));
+  const ba   = rows.map(r=>toNum(get(r,"best_ask")));
+
+  const spread = rows.map(r=>toNum(get(r,"spread")));
+  const inv = rows.map(r=>toNum(get(r,"inventory")));
+
+  return {x, mid, fair, qbid, qask, bb, ba, spread, inv, n: rows.length, header};
+}
+
+function slice(endIdx, W){
+  const start = Math.max(0, endIdx - W + 1);
+  const pick = a => a.slice(start, endIdx+1);
+  return {
+    x:pick(dataAll.x),
+    mid:pick(dataAll.mid),
+    fair:pick(dataAll.fair),
+    qbid:pick(dataAll.qbid),
+    qask:pick(dataAll.qask),
+    bb:pick(dataAll.bb),
+    ba:pick(dataAll.ba),
+  };
+}
+
+/** ========= PLOTLY ========= **/
+function traces(s){
+  const t = [];
+
+  // Banda mercado (relleno entre best_bid y best_ask)
+  if(cbs.band.checked){
+    t.push({
+      x:s.x, y:s.bb,
+      mode:"lines", name:"", showlegend:false,
+      line:{width:0},
+      hoverinfo:"skip"
+    });
+    t.push({
+      x:s.x, y:s.ba,
+      mode:"lines", name:"Banda mercado",
+      fill:"tonexty",
+      fillcolor:"rgba(176,76,255,0.12)",
+      line:{width:0},
+      hovertemplate:"BestAsk=%{y}<extra></extra>"
+    });
+  }
+
+  if(cbs.bb.checked){
+    t.push({
+      x:s.x,y:s.bb, mode:"lines", name:"Best Bid (mkt)",
+      line:{width:2, dash:"dash"},
+      hovertemplate:"BestBid=%{y}<extra></extra>"
+    });
+  }
+  if(cbs.ba.checked){
+    t.push({
+      x:s.x,y:s.ba, mode:"lines", name:"Best Ask (mkt)",
+      line:{width:2, dash:"dash"},
+      hovertemplate:"BestAsk=%{y}<extra></extra>"
+    });
+  }
+
+  if(cbs.mid.checked){
+    t.push({
+      x:s.x,y:s.mid, mode:"lines", name:"Mid",
+      line:{width:2},
+      hovertemplate:"Mid=%{y}<extra></extra>"
+    });
+  }
+
+  if(cbs.fair.checked){
+    t.push({
+      x:s.x,y:s.fair, mode:"lines", name:"Kalman Fair",
+      line:{width:3},
+      hovertemplate:"Fair=%{y}<extra></extra>"
+    });
+  }
+
+  if(cbs.bid.checked){
+    t.push({
+      x:s.x,y:s.qbid, mode:"lines", name:"Quote Bid",
+      line:{width:2, dash:"dot"},
+      hovertemplate:"QuoteBid=%{y}<extra></extra>"
+    });
+  }
+
+  if(cbs.ask.checked){
+    t.push({
+      x:s.x,y:s.qask, mode:"lines", name:"Quote Ask",
+      line:{width:2, dash:"dot"},
+      hovertemplate:"QuoteAsk=%{y}<extra></extra>"
+    });
+  }
+
+  return t;
+}
+
+const layout = {
+  paper_bgcolor:"rgba(0,0,0,0)",
+  plot_bgcolor:"rgba(0,0,0,0)",
+  margin:{l:60,r:20,t:10,b:50},
+  xaxis:{title:"Tiempo / ticks", gridcolor:"rgba(255,255,255,0.07)"},
+  yaxis:{title:"Precio", gridcolor:"rgba(255,255,255,0.07)"},
+  legend:{orientation:"h", x:0.02, y:1.12},
+  font:{color:"rgba(255,255,255,.92)"},
+};
+
+function render(){
+  if(!dataAll) return;
+
+  speedVal.textContent = speed.value;
+  winVal.textContent = win.value;
+
+  const W = Number(win.value);
+  const s = slice(idx, W);
+
+  const ys = [].concat(
+    (cbs.mid.checked  ? s.mid  : []),
+    (cbs.fair.checked ? s.fair : []),
+    (cbs.bid.checked  ? s.qbid : []),
+    (cbs.ask.checked  ? s.qask : []),
+    (cbs.bb.checked   ? s.bb   : []),
+    (cbs.ba.checked   ? s.ba   : [])
+  ).filter(v => v!==null && !Number.isNaN(v));
+
+  if(ys.length){
+    const ymin = Math.max(0, Math.min(...ys) - 0.01);
+    const ymax = Math.min(1, Math.max(...ys) + 0.01);
+    layout.yaxis.range = [ymin, ymax];
+  } else {
+    delete layout.yaxis.range;
+  }
+
+  Plotly.react("chart", traces(s), layout, {
+    responsive:true,
+    displaylogo:false,
+    displayModeBar:false,
+  });
+
+  status.textContent = `Estado: ${playing ? "reproduciendo" : "pausado"} · tick ${idx+1}/${dataAll.n}`;
+}
+
+/** ========= PLAYBACK ========= **/
+function setPlaying(on){
+  playing = on;
+  playBtn.textContent = playing ? "⏸ Pause" : "▶ Play";
+
+  if(timer){ clearInterval(timer); timer=null; }
+
+  if(playing){
+    const ms = Math.max(16, Math.floor(1000 / Number(speed.value)));
+    timer = setInterval(()=>{
+      idx++;
+      if(idx >= dataAll.n){
+        // setPlaying(false);
+        idx = 0;
+      }
+      render();
+    }, ms);
+  }
+}
+
+/** ========= AUTOLOAD (FETCH) ========= **/
+async function loadFromURL(){
+  // cache-bust para que el navegador no se quede con una versión vieja
+  const url = AUTOLOAD_URL + "?t=" + Date.now();
+
+  const r = await fetch(url, { cache:"no-store" });
+  if(!r.ok){
+    throw new Error("No se pudo cargar " + AUTOLOAD_URL + " (HTTP " + r.status + ")");
+  }
+  const text = await r.text();
+  const parsed = parseCSV(text);
+
+  // si venías reproduciendo, intenta mantenerte cerca del final
+  const wasAtEnd = dataAll ? (idx >= dataAll.n - 2) : true;
+
+  dataAll = parsed;
+
+  // si estamos “en vivo”, pegarnos al final; si no, no tocar tanto
+  if(wasAtEnd){
+    idx = Math.max(0, dataAll.n - 1);
+  } else {
+    idx = Math.min(idx, dataAll.n - 1);
+  }
+
+  lastLoadedRows = dataAll.n;
+
+  status.textContent = `CSV auto-cargado: ${dataAll.n} filas · ${AUTOLOAD_URL}`;
+  render();
+}
+
+async function tryAutoloadOnce(){
+  try{
+    await loadFromURL();
+  }catch(e){
+    status.textContent = `Estado: esperando CSV… (no pude auto-cargar ${AUTOLOAD_URL}). Usa “Cargar CSV” o sirve la carpeta con http.server.`;
+    console.warn(e);
+  }
+}
+
+function setAutoRefresh(on){
+  if(autoTimer){ clearInterval(autoTimer); autoTimer=null; }
+  if(on){
+    autoTimer = setInterval(async ()=>{
+      try{
+        await loadFromURL();
+      }catch(e){
+        // no spamear la UI; solo consola
+        console.warn("autoreload:", e);
+      }
+    }, AUTORELOAD_MS);
+  }
+}
+
+/** ========= EVENTS ========= **/
+playBtn.addEventListener("click", ()=> {
+  if(!dataAll) return;
+
+  // si estás al final y le das play, vuelve al principio
+  if(!playing && idx >= dataAll.n - 1){
+    idx = 0;
+  }
+
+  setPlaying(!playing);
+  render();
+});
+
+
+reloadBtn.addEventListener("click", async ()=> {
+  await tryAutoloadOnce();
+});
+
+autoRefresh.addEventListener("change", ()=> {
+  setAutoRefresh(autoRefresh.checked);
+});
+
+speed.addEventListener("input", ()=> { if(playing) setPlaying(true); render(); });
+win.addEventListener("input", ()=> render());
+Object.values(cbs).forEach(cb => cb.addEventListener("change", ()=> render()));
+
+file.addEventListener("change", async (e)=>{
+  const f = e.target.files?.[0];
+  if(!f) return;
+
+  const text = await f.text();
+  dataAll = parseCSV(text);
+
+  idx = Math.min(250, Math.max(0, dataAll.n-1));
+  status.textContent = `CSV cargado manual: ${dataAll.n} filas · columnas: ${dataAll.header.join(", ")}`;
+  render();
+});
+
+/** ========= BOOT ========= **/
+tryAutoloadOnce(); // intenta auto-cargar al abrir
+</script>
+</body>
+</html>

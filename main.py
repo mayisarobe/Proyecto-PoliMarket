@@ -7,6 +7,10 @@ import re
 import time
 from typing import Dict, List, Tuple, Optional
 from urllib.parse import urlparse, parse_qs
+# ============================================================
+import os
+from datetime import datetime, timezone
+
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -18,6 +22,65 @@ from fairprice import FairPrice            # Kalman 1D mejorado (usa clip_prob/c
 from spread import SpreadCalculator        # Avellaneda–Stoikov mejorado
 
 CLOB_BASE = "https://clob.polymarket.com"
+
+# ============================================================
+#                 VISUALIZACIÓN / GRÁFICAS
+# ============================================================
+
+class TickLogger:
+    def __init__(self, path: str):
+        self.path = path
+        self._f = None
+        self._w = None
+        self._header_written = False
+
+    def open(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        self._f = open(self.path, "w", newline="", encoding="utf-8")
+        self._w = csv.DictWriter(self._f, fieldnames=[
+            "ts",
+            "best_bid",
+            "best_ask",
+            "mid",
+            "fair",
+            "bid",
+            "ask",
+            "spread",
+            "inventory"
+        ])
+
+        self._w.writeheader()
+        self._header_written = True
+
+    def log(self, *, ts, best_bid, best_ask, mid, fair, bid, ask, spread=None, inventory=None):
+        if not self._header_written:
+            self.open()
+
+        def _f(x):
+            return "" if x is None else float(x)
+
+        self._w.writerow({
+            "ts": ts,
+            "best_bid": _f(best_bid),
+            "best_ask": _f(best_ask),
+            "mid": _f(mid),
+            "fair": _f(fair),
+            "bid": _f(bid),
+            "ask": _f(ask),
+            "spread": "" if spread is None else _f(spread),
+            "inventory": "" if inventory is None else _f(inventory),
+
+        })
+        self._f.flush()
+
+    def close(self):
+        if self._f:
+            self._f.close()
+            self._f = None
+            self._w = None
+            self._header_written = False
+
+
 
 # ============================================================
 #          SESIÓN HTTP ROBUSTA (CONEXIÓN AL MERCADO)
@@ -446,290 +509,312 @@ def main():
 
     args = ap.parse_args()
 
-    # ===== Listado de outcomes (sin operar) =====
-    if args.list_outcomes:
-        if args.token_id:
-            print("Con --token_id no hay outcomes que listar (ya es un único outcome).")
+    logger = TickLogger("replay.csv")
+    logger.open()
+
+    try:
+
+
+        # ===== Listado de outcomes (sin operar) =====
+        if args.list_outcomes:
+            if args.token_id:
+                print("Con --token_id no hay outcomes que listar (ya es un único outcome).")
+                return
+            if args.url:
+                parsed = parse_polymarket_url(args.url)
+                if "slug" not in parsed:
+                    raise SystemExit("URL sin slug. Usa --url .../event/<slug> o --condition_id.")
+                market = find_market_by_slug(parsed["slug"])
+            elif args.condition_id:
+                market = find_market_by_condition(args.condition_id)
+            else:
+                raise SystemExit("Para --list_outcomes usa --url <...> o --condition_id <0x...>")
+            q, mapping, outcomes = outcome_to_token_map(market)
+            print(f"== {q} ==")
+            for i, o in enumerate(outcomes):
+                print(f"[{i}] {o} -> {mapping[o]}")
             return
-        if args.url:
-            parsed = parse_polymarket_url(args.url)
-            if "slug" not in parsed:
-                raise SystemExit("URL sin slug. Usa --url .../event/<slug> o --condition_id.")
-            market = find_market_by_slug(parsed["slug"])
-        elif args.condition_id:
-            market = find_market_by_condition(args.condition_id)
-        else:
-            raise SystemExit("Para --list_outcomes usa --url <...> o --condition_id <0x...>")
-        q, mapping, outcomes = outcome_to_token_map(market)
-        print(f"== {q} ==")
-        for i, o in enumerate(outcomes):
-            print(f"[{i}] {o} -> {mapping[o]}")
-        return
 
-    # ===== Resolver token_id =====
-    token_id = resolve_token_id(args)
-    if args.debug:
-        print(f"[debug] token_id={token_id}")
-        print(f"[debug] mode={args.mode}, role={args.role}, dry_run={args.dry_run}")
+        # ===== Resolver token_id =====
+        token_id = resolve_token_id(args)
+        if args.debug:
+            print(f"[debug] token_id={token_id}")
+            print(f"[debug] mode={args.mode}, role={args.role}, dry_run={args.dry_run}")
 
-    # ===== Instancias (tus clases) =====
-    kf = FairPrice(
-        initial_price=args.initial_price,
-        process_variance=args.process_variance,
-        measurement_variance=args.measurement_variance,
-        initial_variance=args.initial_variance,
-        clip_prob=args.clip01,
-        q_alpha=0.10,
-        q_gain=0.15
-    )
-
-    sc = SpreadCalculator(
-        gamma=args.gamma,
-        lam=args.lam,
-        window=200,
-        ewma_alpha=0.15,
-        k_spread=0.35,
-        k_imb=0.015,
-        edge_k=0.30,
-        hard_max=0.20
-    )
-
-    client = TradingClient(
-        dry_run=args.dry_run,
-        require_approval=not args.auto_approve
-    )
-
-    # ===== Buffers de serie (backtest y logging) =====
-    times: List[float] = []
-    mids: List[float] = []
-    fairs: List[float] = []
-    fair_vars: List[float] = []
-    bidq: List[float] = []
-    askq: List[float] = []
-    best_bids: List[Optional[float]] = []
-    best_asks: List[Optional[float]] = []
-
-    t0 = time.time()
-    last_mid: Optional[float] = None
-
-    # ===== Estado de inventario / cash (NUEVO) =====
-    # Empiezas en args.inv por si quieres partir de una posición no nula
-    inventory: float = args.inv
-    cash: float = 0.0  # PnL acumulado en prob units (aprox f*pos)
-
-    def check_limits(side: str, size: float, price: float) -> bool:
-        """
-        Comprueba límites de inventario y exposición antes de mandar una orden.
-        """
-        nonlocal inventory
-        s = side.upper()
-        delta = size if s == "BUY" else -size
-        new_inv = inventory + delta
-        if abs(new_inv) > args.max_inventory:
-            if args.debug:
-                print(f"[RISK] Límite de inventario superado: {new_inv} > {args.max_inventory}")
-            return False
-
-        notional_after = abs(new_inv * price)
-        if notional_after > args.max_notional:
-            if args.debug:
-                print(f"[RISK] Límite nocional superado: {notional_after:.4f} > {args.max_notional:.4f}")
-            return False
-
-        return True
-
-    # ============================================================
-    #                 LÓGICA DE UN PASO DE MERCADO
-    # ============================================================
-    def one_step(now: float):
-        nonlocal last_mid, inventory, cash
-
-        bb, ba = get_best_bid_ask(token_id, debug=args.debug)
-        mid = safe_mid(bb, ba, last_mid, args.initial_price)
-
-        # Fair price
-        if bb is not None and ba is not None:
-            fair, var = kf.update_from_orderbook(bb, ba)
-        else:
-            fair, var = kf.update(mid)
-
-        # Microestructura para spread
-        if bb is not None and ba is not None:
-            sc.update_micro(best_bid=bb, best_ask=ba)
-
-        # Cotizaciones (Avellaneda–Stoikov)
-        # IMPORTANTE: pasamos el INVENTARIO actual para que ajuste el precio de reserva
-        bid, ask, full = sc.quotes(
-            fair=fair,
-            fair_var=var,
-            inv=inventory,
-            inv_limit=args.inv_limit
+        # ===== Instancias (tus clases) =====
+        kf = FairPrice(
+            initial_price=args.initial_price,
+            process_variance=args.process_variance,
+            measurement_variance=args.measurement_variance,
+            initial_variance=args.initial_variance,
+            clip_prob=args.clip01,
+            q_alpha=0.10,
+            q_gain=0.15
         )
 
-        # ---- Registro de serie (para backtest / logging) ----
-        times.append(now)
-        mids.append(mid)
-        fairs.append(fair)
-        fair_vars.append(var)
-        bidq.append(bid)
-        askq.append(ask)
-        best_bids.append(bb if bb is not None else "")
-        best_asks.append(ba if ba is not None else "")
+        sc = SpreadCalculator(
+            gamma=args.gamma,
+            lam=args.lam,
+            window=200,
+            ewma_alpha=0.15,
+            k_spread=0.35,
+            k_imb=0.015,
+            edge_k=0.30,
+            hard_max=0.20
+        )
 
-        if args.debug:
-            print(
-                f"[step] t={now:.1f}s mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
-                f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba} | "
-                f"inv={inventory:.2f} cash={cash:.2f}"
+        client = TradingClient(
+            dry_run=args.dry_run,
+            require_approval=not args.auto_approve
+        )
+
+        # ===== Buffers de serie (backtest y logging) =====
+        times: List[float] = []
+        mids: List[float] = []
+        fairs: List[float] = []
+        fair_vars: List[float] = []
+        bidq: List[float] = []
+        askq: List[float] = []
+        best_bids: List[Optional[float]] = []
+        best_asks: List[Optional[float]] = []
+
+        t0 = time.time()
+        last_mid: Optional[float] = None
+
+        # ===== Estado de inventario / cash (NUEVO) =====
+        # Empiezas en args.inv por si quieres partir de una posición no nula
+        inventory: float = args.inv
+        cash: float = 0.0  # PnL acumulado en prob units (aprox f*pos)
+
+        def check_limits(side: str, size: float, price: float) -> bool:
+            """
+            Comprueba límites de inventario y exposición antes de mandar una orden.
+            """
+            nonlocal inventory
+            s = side.upper()
+            delta = size if s == "BUY" else -size
+            new_inv = inventory + delta
+            if abs(new_inv) > args.max_inventory:
+                if args.debug:
+                    print(f"[RISK] Límite de inventario superado: {new_inv} > {args.max_inventory}")
+                return False
+
+            notional_after = abs(new_inv * price)
+            if notional_after > args.max_notional:
+                if args.debug:
+                    print(f"[RISK] Límite nocional superado: {notional_after:.4f} > {args.max_notional:.4f}")
+                return False
+
+            return True
+
+        # ============================================================
+        #                 LÓGICA DE UN PASO DE MERCADO
+        # ============================================================
+        def one_step(now: float):
+            nonlocal last_mid, inventory, cash
+
+            bb, ba = get_best_bid_ask(token_id, debug=args.debug)
+            mid = safe_mid(bb, ba, last_mid, args.initial_price)
+
+            # Fair price
+            if bb is not None and ba is not None:
+                fair, var = kf.update_from_orderbook(bb, ba)
+            else:
+                fair, var = kf.update(mid)
+
+            # Microestructura para spread
+            if bb is not None and ba is not None:
+                sc.update_micro(best_bid=bb, best_ask=ba)
+
+            # Cotizaciones (Avellaneda–Stoikov)
+            # IMPORTANTE: pasamos el INVENTARIO actual para que ajuste el precio de reserva
+            bid, ask, full = sc.quotes(
+                fair=fair,
+                fair_var=var,
+                inv=inventory,
+                inv_limit=args.inv_limit
             )
 
-        # ---- Estrategia de trading según rol ----
-        if args.mode == "live":
-            if args.role == "maker":
-                if bb is None or ba is None:
+            # ===== CSV replay =====
+            ts = datetime.now(timezone.utc).isoformat()
+            logger.log(
+                ts=ts,
+                best_bid=bb,
+                best_ask=ba,
+                mid=mid,
+                fair=fair,
+                bid=bid,
+                ask=ask,
+                spread=(ask - bid) if (ask is not None and bid is not None) else None,
+                inventory=inventory
+            )
+
+
+            # ---- Registro de serie (para backtest / logging) ----
+            times.append(now)
+            mids.append(mid)
+            fairs.append(fair)
+            fair_vars.append(var)
+            bidq.append(bid)
+            askq.append(ask)
+            best_bids.append(bb if bb is not None else "")
+            best_asks.append(ba if ba is not None else "")
+
+            if args.debug:
+                print(
+                    f"[step] t={now:.1f}s mid={mid:.4f} fair={fair:.4f} (P={var:.6f}) | "
+                    f"bid={bid:.4f} ask={ask:.4f} | bestBid={bb} bestAsk={ba} | "
+                    f"inv={inventory:.2f} cash={cash:.2f}"
+                )
+
+            # ---- Estrategia de trading según rol ----
+            if args.mode == "live":
+                if args.role == "maker":
+                    if bb is None or ba is None:
+                        if args.debug:
+                            print("[MAKER] Libro vacío, no coto.")
+                        last_mid = mid
+                        return
+
+                    # Asegurar quotes dentro de [0.01, 0.99]
+                    q_bid = max(0.01, min(0.99, bid))
+                    q_ask = max(0.01, min(0.99, ask))
+
+                    # Evitar quotes cruzadas
+                    if q_bid >= q_ask:
+                        mid_raw = (bb + ba) / 2.0
+                        half_spread_min = 0.003
+                        q_bid = max(0.01, mid_raw - half_spread_min)
+                        q_ask = min(0.99, mid_raw + half_spread_min)
+
+                    # Cancelamos órdenes anteriores antes de cotizar las nuevas
+                    client.cancel_open_orders(token_id)
+
+                    # Chequeo de límites antes de poner las órdenes
                     if args.debug:
-                        print("[MAKER] Libro vacío, no coto.")
-                    last_mid = mid
-                    return
+                        print(f"[MAKER] quoting bid={q_bid:.4f}, ask={q_ask:.4f}, size={args.order_size}")
 
-                # Asegurar quotes dentro de [0.01, 0.99]
-                q_bid = max(0.01, min(0.99, bid))
-                q_ask = max(0.01, min(0.99, ask))
+                    # Para maker, el inventario real debería actualizarse con fills reales
+                    # (por ahora asumimos que se gestiona fuera, aquí solo cotizamos)
+                    if check_limits("BUY", args.order_size, q_bid):
+                        client.send_limit_order(token_id, "BUY", q_bid, args.order_size)
+                    else:
+                        if args.debug:
+                            print("[MAKER] BID bloqueado por límites de riesgo.")
 
-                # Evitar quotes cruzadas
-                if q_bid >= q_ask:
-                    mid_raw = (bb + ba) / 2.0
-                    half_spread_min = 0.003
-                    q_bid = max(0.01, mid_raw - half_spread_min)
-                    q_ask = min(0.99, mid_raw + half_spread_min)
+                    if check_limits("SELL", args.order_size, q_ask):
+                        client.send_limit_order(token_id, "SELL", q_ask, args.order_size)
+                    else:
+                        if args.debug:
+                            print("[MAKER] ASK bloqueado por límites de riesgo.")
 
-                # Cancelamos órdenes anteriores antes de cotizar las nuevas
-                client.cancel_open_orders(token_id)
+                elif args.role == "taker":
+                    # Liquidity Taker: ejecuta solo cuando hay edge suficiente
+                    if bb is None or ba is None:
+                        last_mid = mid
+                        return
 
-                # Chequeo de límites antes de poner las órdenes
-                if args.debug:
-                    print(f"[MAKER] quoting bid={q_bid:.4f}, ask={q_ask:.4f}, size={args.order_size}")
+                    # Edge: fair vs niveles del book
+                    edge_buy = fair - ba      # si fair > ask ⇒ queremos comprar
+                    edge_sell = bb - fair     # si bid > fair ⇒ queremos vender
 
-                # Para maker, el inventario real debería actualizarse con fills reales
-                # (por ahora asumimos que se gestiona fuera, aquí solo cotizamos)
-                if check_limits("BUY", args.order_size, q_bid):
-                    client.send_limit_order(token_id, "BUY", q_bid, args.order_size)
-                else:
-                    if args.debug:
-                        print("[MAKER] BID bloqueado por límites de riesgo.")
+                    acted = False
 
-                if check_limits("SELL", args.order_size, q_ask):
-                    client.send_limit_order(token_id, "SELL", q_ask, args.order_size)
-                else:
-                    if args.debug:
-                        print("[MAKER] ASK bloqueado por límites de riesgo.")
+                    # BUY (tomar el ask)
+                    if edge_buy > args.taker_edge:
+                        price = ba
+                        if check_limits("BUY", args.order_size, price):
+                            print(f"[TAKER] BUY signal → fair={fair:.4f} > ask={ba:.4f} (edge={edge_buy:.4f})")
+                            sent = client.send_market_taker(
+                                token_id, "BUY", args.order_size, ref_price=price
+                            )
+                            if sent:
+                                delta = args.order_size
+                                inventory += delta
+                                cash -= delta * price
+                                acted = True
+                        elif args.debug:
+                            print(f"[TAKER] BUY bloqueado por límites de riesgo (edge={edge_buy:.4f}).")
 
-            elif args.role == "taker":
-                # Liquidity Taker: ejecuta solo cuando hay edge suficiente
-                if bb is None or ba is None:
-                    last_mid = mid
-                    return
+                    # SELL (pegar al bid)
+                    if edge_sell > args.taker_edge:
+                        price = bb
+                        if check_limits("SELL", args.order_size, price):
+                            print(f"[TAKER] SELL signal → bid={bb:.4f} > fair={fair:.4f} (edge={edge_sell:.4f})")
+                            sent = client.send_market_taker(
+                                token_id, "SELL", args.order_size, ref_price=price
+                            )
+                            if sent:
+                                delta = -args.order_size
+                                inventory += delta
+                                cash -= delta * price
+                                acted = True
+                        elif args.debug:
+                            print(f"[TAKER] SELL bloqueado por límites de riesgo (edge={edge_sell:.4f}).")
 
-                # Edge: fair vs niveles del book
-                edge_buy = fair - ba      # si fair > ask ⇒ queremos comprar
-                edge_sell = bb - fair     # si bid > fair ⇒ queremos vender
+                    if not acted and args.debug:
+                        print(f"[TAKER] No action, edges: buy={edge_buy:.4f}, sell={edge_sell:.4f}")
 
-                acted = False
+            last_mid = mid
+            if args.debug:
+                print(f"[mid] bb={bb} ba={ba} mid={mid}")
 
-                # BUY (tomar el ask)
-                if edge_buy > args.taker_edge:
-                    price = ba
-                    if check_limits("BUY", args.order_size, price):
-                        print(f"[TAKER] BUY signal → fair={fair:.4f} > ask={ba:.4f} (edge={edge_buy:.4f})")
-                        sent = client.send_market_taker(
-                            token_id, "BUY", args.order_size, ref_price=price
-                        )
-                        if sent:
-                            delta = args.order_size
-                            inventory += delta
-                            cash -= delta * price
-                            acted = True
-                    elif args.debug:
-                        print(f"[TAKER] BUY bloqueado por límites de riesgo (edge={edge_buy:.4f}).")
+        # ============================================================
+        #                     EJECUCIÓN SEGÚN MODO
+        # ============================================================
+        if args.mode == "backtest":
+            # ===== Loop principal de backtest =====
+            for i in range(args.samples):
+                now = time.time() - t0
+                one_step(now)
+                if i < args.samples - 1:
+                    time.sleep(max(0.0, args.interval))
 
-                # SELL (pegar al bid)
-                if edge_sell > args.taker_edge:
-                    price = bb
-                    if check_limits("SELL", args.order_size, price):
-                        print(f"[TAKER] SELL signal → bid={bb:.4f} > fair={fair:.4f} (edge={edge_sell:.4f})")
-                        sent = client.send_market_taker(
-                            token_id, "SELL", args.order_size, ref_price=price
-                        )
-                        if sent:
-                            delta = -args.order_size
-                            inventory += delta
-                            cash -= delta * price
-                            acted = True
-                    elif args.debug:
-                        print(f"[TAKER] SELL bloqueado por límites de riesgo (edge={edge_sell:.4f}).")
+            # ===== CSV =====
+            with open(args.csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["time_s","best_bid","best_ask","mid","fair","fair_var","quote_bid","quote_ask"])
+                for row in zip(times, best_bids, best_asks, mids, fairs, fair_vars, bidq, askq):
+                    w.writerow(row)
+            print(f"✅ Serie temporal guardada en: {args.csv}")
 
-                if not acted and args.debug:
-                    print(f"[TAKER] No action, edges: buy={edge_buy:.4f}, sell={edge_sell:.4f}")
+            # ===== Gráfica =====
+            plt.figure(figsize=(10, 5))
+            plt.plot(times, mids, label="Mid observado")
+            plt.plot(times, fairs, label="Fair price (Kalman)")
+            plt.plot(times, bidq, label="Bid cotizado")
+            plt.plot(times, askq, label="Ask cotizado")
+            plt.ylim(0.0, 1.0)
+            plt.xlabel("Tiempo (s)")
+            plt.ylabel("Precio")
+            plt.title("Fair price (Kalman) + Avellaneda–Stoikov | Polymarket")
+            plt.grid(True, alpha=0.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(args.png, dpi=150)
+            print(f"📈 Gráfica guardada en: {args.png}")
 
-        last_mid = mid
-        if args.debug:
-            print(f"[mid] bb={bb} ba={ba} mid={mid}")
+            # ===== Resumen corto para el pitch =====
+            avg_spread = sum(a - b for a, b in zip(askq, bidq)) / max(1, len(bidq))
+            drift = (fairs[-1] - fairs[0]) if fairs else 0.0
+            print(f"Resumen → spread_medio={avg_spread:.4f} | drift_fair={drift:+.4f}")
 
-    # ============================================================
-    #                     EJECUCIÓN SEGÚN MODO
-    # ============================================================
-    if args.mode == "backtest":
-        # ===== Loop principal de backtest =====
-        for i in range(args.samples):
-            now = time.time() - t0
-            one_step(now)
-            if i < args.samples - 1:
+        else:
+            # ===== MODO LIVE: estrategia de trading en tiempo real =====
+            print(f"🚀 Modo LIVE iniciado | role={args.role} | dry_run={args.dry_run} | order_size={args.order_size}")
+            start = time.time()
+            step_idx = 0
+            while True:
+                now = time.time() - t0
+                one_step(now)
+                step_idx += 1
                 time.sleep(max(0.0, args.interval))
 
-        # ===== CSV =====
-        with open(args.csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["time_s","best_bid","best_ask","mid","fair","fair_var","quote_bid","quote_ask"])
-            for row in zip(times, best_bids, best_asks, mids, fairs, fair_vars, bidq, askq):
-                w.writerow(row)
-        print(f"✅ Serie temporal guardada en: {args.csv}")
-
-        # ===== Gráfica =====
-        plt.figure(figsize=(10, 5))
-        plt.plot(times, mids, label="Mid observado")
-        plt.plot(times, fairs, label="Fair price (Kalman)")
-        plt.plot(times, bidq, label="Bid cotizado")
-        plt.plot(times, askq, label="Ask cotizado")
-        plt.ylim(0.0, 1.0)
-        plt.xlabel("Tiempo (s)")
-        plt.ylabel("Precio")
-        plt.title("Fair price (Kalman) + Avellaneda–Stoikov | Polymarket")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(args.png, dpi=150)
-        print(f"📈 Gráfica guardada en: {args.png}")
-
-        # ===== Resumen corto para el pitch =====
-        avg_spread = sum(a - b for a, b in zip(askq, bidq)) / max(1, len(bidq))
-        drift = (fairs[-1] - fairs[0]) if fairs else 0.0
-        print(f"Resumen → spread_medio={avg_spread:.4f} | drift_fair={drift:+.4f}")
-
-    else:
-        # ===== MODO LIVE: estrategia de trading en tiempo real =====
-        print(f"🚀 Modo LIVE iniciado | role={args.role} | dry_run={args.dry_run} | order_size={args.order_size}")
-        start = time.time()
-        step_idx = 0
-        while True:
-            now = time.time() - t0
-            one_step(now)
-            step_idx += 1
-            time.sleep(max(0.0, args.interval))
-
-            if args.live_seconds > 0 and (time.time() - start) >= args.live_seconds:
-                print("⏱️ live_seconds alcanzado, saliendo de modo live.")
-                break
-
+                if args.live_seconds > 0 and (time.time() - start) >= args.live_seconds:
+                    print("⏱️ live_seconds alcanzado, saliendo de modo live.")
+                    break
+    finally:
+        logger.close()
         # En live normalmente no guardas gráfico, pero tienes las series en memoria si quieres.
 
 if __name__ == "__main__":
